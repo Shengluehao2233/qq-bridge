@@ -43,7 +43,10 @@ import { discoverDshSessionCookie, NodeApiClient, unwrap } from '../src/dsh-clie
 
 const ROOT = process.cwd();
 const DSH_MODULES = dshModulesDir();
-const DSH_HOME = path.join(os.homedir(), '.dsh');
+// 必须跟随 DSH_HOME：本机跑了两个 DSH 实例（桌面 ~/.dsh 与 qq 专用 ~/.dsh-qq），
+// 硬编码 os.homedir()/.dsh 会去检查错误的实例（profile patch 结构不同，还会直接崩）。
+// 与 scripts/dsh-modules.mjs 的 dshHome() 保持同一口径。
+const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
 const BASE = process.env.DSH_BASE_URL || 'http://127.0.0.1:3080';
 
 let pass = 0, fail = 0;
