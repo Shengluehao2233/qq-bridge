@@ -133,6 +133,10 @@ const LOCAL_EXECUTION_TOOLS = [
   // 插件/cordis 运行期检查：能读宿主状态（0.1.7 起只有这两个名字）
   'cordis_inspect_list', 'cordis_inspect_query',
   // 本机文件 + 进程：plugin-guard 会改写配置并 spawn pnpm
+  // 注（本机 2026-10-11）：这三个名字来自 `dsh-plugin-guard` bundle，本 profile 没装它，
+  // 因此启动日志会有三行 `skip restrict <name>: unknown global tool`。这是**预期噪音**：
+  // apply() 是逐个名字 restrict 的（见下方循环注释），未知名字单独跳过、不影响其余名字；
+  // 而上游 test-preset-local-tools.mjs 又要求这三个名字**必须**在名单里，所以不要删。
   'dsh_snapshot', 'dsh_rollback', 'incident_resolved',
   // 会话/交付/任务面
   // 注意：`todo_write` 与 `ask_user_question` **故意不在**此名单——它们是下面

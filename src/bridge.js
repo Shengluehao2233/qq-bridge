@@ -178,6 +178,34 @@ function renameWithRetry(from, to, attempts = 4) {
 }
 
 // 原子写 JSON 文件：先写唯一临时文件再 rename，避免进程中断写坏配置，也避免固定临时名被并发/符号链接攻击利用。
+//
+// rename 在 Windows 上可能被 EPERM/EBUSY 拒绝（OneDrive 同步、杀软或索引器短暂
+// 持有目标文件时就会发生）。旧实现直接抛错、调用方只记一条日志，于是整份内存状态
+// 被静默丢弃、磁盘留下过期快照，并永久残留一个 .tmp。这里改为：短暂重试 → 仍失败
+// 则退化为「覆盖写目标文件」（短暂失去原子性，但保住数据，优于丢弃），并且无论如何
+// 都清掉临时文件。
+function publishTempFile(tmp, file) {
+  const delays = [40, 120, 300];
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      fs.renameSync(tmp, file);
+      return;
+    } catch (error) {
+      const transient = error?.code === 'EPERM' || error?.code === 'EBUSY' || error?.code === 'EACCES';
+      if (!transient || attempt >= delays.length) {
+        try {
+          fs.copyFileSync(tmp, file);
+        } finally {
+          try { fs.unlinkSync(tmp); } catch {}
+        }
+        return;
+      }
+      const until = Date.now() + delays[attempt];
+      while (Date.now() < until) { /* 短暂自旋等待持有者释放 */ }
+    }
+  }
+}
+
 function atomicWriteJson(file, obj) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
@@ -202,6 +230,17 @@ function atomicWriteText(file, text) {
     try { fs.unlinkSync(tmp); } catch {}
     throw error;
   }
+}
+
+// 启动时清理历史遗留的临时文件（早期 rename 失败会永久残留，白白占用空间）。
+// 上游 v0.2.0 的 renameWithRetry 失败路径已经会 unlink 自己的 tmp，这里只是兜底清历史垃圾。
+function sweepStaleTempFiles(dir) {
+  try {
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.endsWith('.tmp')) continue;
+      try { fs.unlinkSync(path.join(dir, name)); } catch {}
+    }
+  } catch {}
 }
 
 // 控制台鉴权 token：未配置时自动生成并持久化到 state/console-token，避免默认无鉴权。
@@ -657,12 +696,17 @@ function loadConfig() {
   if (!file || typeof file !== 'object' || Array.isArray(file)) throw new Error(`配置格式错误：${p}`);
   const cfg = {
     dsh: {
-      baseUrl: 'http://127.0.0.1:3080',
+      baseUrl: 'http://127.0.0.1:3082',
       provider: 'deepseek-official',
-      // 多模态模型：DeepSeek-V41-Flash（DSH 模型目录里 inputModalities 含 image）。
-      // 旧默认 deepseek-v4-flash-vision-exp 已被取代；config.json 未配置时用此兜底。
+      // 统一使用 DeepSeek-V41-Flash（DSH 注册的 id 是 deepseek-flash），它声明了
+      // inputModalities: text+image，是唯一能真正读图的正式模型。
+      // 别写 deepseek-v41-flash / deepseek-v4.1-flash：DSH 会照单全收，但网关不认，
+      // 回合会以 turn error 结束并把 "The supported API model names are …" 抛到 QQ 群里
+      // （2026-09-24 真的发生过，被群友截图追问）。
+      // 也别用 deepseek-v4-flash / deepseek-v4-pro —— 那两个只声明 text，
+      // qq_get_message_images 会返回 image unavailable。
       model: 'deepseek-flash',
-      reasoningEffort: 'max',
+      reasoningEffort: 'high',
       // 兼容新版 DSH 的 API 鉴权：如果 DSH 升级后要求非浏览器客户端带 token，
       // 在这里配置 token；默认走 Authorization: Bearer <token>。
       authToken: '',
@@ -672,7 +716,7 @@ function loadConfig() {
       allowRemote: false,
       ...(file.dsh ?? {})
     },
-    snowluma: { wsUrl: 'ws://127.0.0.1:3001', accessToken: '', ...(file.snowluma ?? {}) },
+    snowluma: { wsUrl: 'ws://127.0.0.1:2001', accessToken: '', ...(file.snowluma ?? {}) },
     // 空 => 每个会话在 state/agents/<key> 下建独立工作目录
     sessionCwd: file.sessionCwd ?? '',
     agentPreset: file.agentPreset ?? 'qq-chat',
@@ -1386,6 +1430,8 @@ async function main() {
   const cfg = loadConfig();
   fs.mkdirSync(STATE_DIR, { recursive: true });
   hardenStateDirAcl();
+  // 清掉历史 rename 失败残留的 .tmp（不触碰正常状态文件）。
+  sweepStaleTempFiles(STATE_DIR);
   acquireLock();
   loadState();
 
@@ -1944,7 +1990,7 @@ async function main() {
     segments.push({ type: 'image', data: { file: 'base64://' + image.buffer.toString('base64') } });
     const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
     const params = kind === 'private' ? { user_id: Number(id), message: segments } : { group_id: Number(id), message: segments };
-    const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+    const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:2000').replace(/\/+$/, '');
     // 与文本发送共用 sendChain，保证“先文字后表情”的真人顺序不被并发工具调用打乱。
     let sendResolve;
     let sendReject;
@@ -2425,6 +2471,8 @@ async function main() {
   for (const sessionId of Object.values(state.sessions)) api.events.follow(sessionId);
   const sessionPromises = new Map(); // key -> create promise（防并发重复创建）
   const promptQueues = new Map(); // key -> { queue: [], running: false }：每个 QQ 会话串行投递 DSH prompt，保证 turn 顺序
+  const promptQueueEpoch = new Map(); // key -> number：drain（reset/模式切换）后 +1，用来让在途 entry 失效
+  const recallCooldownAt = new Map(); // key -> timestamp：/recall 管理员命令的限频
 
   // ── Token 用量账本（控制台「令牌与花费」） ───────────────────────────────
   // 权威总量取 DSH 的 tokenUsage 投影（整条会话日志累计，含桥接启动前的历史），
@@ -2595,7 +2643,10 @@ async function main() {
     setTimeout(() => { flushQueue(); }, 3000);
   };
 
-  // 从 DSH settings 读取桥接模式；命名空间未注册时回退本地 state/mode.json
+  // 从 DSH settings 读取桥接模式；命名空间未注册或 DSH 不可达时回退本地 state/mode.json。
+  // 返回值说明模式来源，供调用方区分「DSH 权威」与「降级回退」——避免降级被当成
+  // 设置页真实改动而静默走一遍模式切换逻辑。
+  // 注意：VALID_MODES 已由模块级定义（含输入别名），这里不要再声明一份。
   async function refreshMode() {
     try {
       const s = unwrap(await api.settings.describe({}), 'settings.describe');
@@ -2636,7 +2687,7 @@ async function main() {
         if (typeof localPreset?.closedAgentPreset === 'string') {
           closedAgentPreset = localPreset.closedAgentPreset;
         }
-        return;
+        return 'dsh';
       }
     } catch {}
     const local = readJsonSafe(path.join(STATE_DIR, 'mode.json'), null);
@@ -2645,6 +2696,7 @@ async function main() {
     if (typeof local?.closedAgentPreset === 'string' && local.closedAgentPreset) {
       closedAgentPreset = local.closedAgentPreset;
     }
+    return 'local';
   }
 
   /** 拉取 DSH 当前可用的 agent preset 清单（供控制台下拉与 closed-agent 兜底使用）。 */
@@ -2894,7 +2946,9 @@ async function main() {
       ok = true;
     } catch {}
     if (ok) {
-      await refreshMode();
+      // 模式来源：'dsh' = 设置页说了算；'local' = DSH 正常但没注册 qq-mode 命名空间，
+      // 回退本地 mode.json。DSH 不可用的情况走不到这里（见下方 else）。
+      const modeSource = await refreshMode();
       // DSH 起来后拉一次 preset 清单；DSH 重启（dshReady 由 false 变 true）时再拉一次。
       if (!dshReady || dshPresetIds.length === 0) {
         try { await refreshPresetList(); } catch {}
@@ -2903,7 +2957,7 @@ async function main() {
       if (!dshReady) {
         dshReady = true;
         lastMode = currentMode;
-        log(`DSH 已就绪（模式: ${currentMode}）`);
+        log(`DSH 已就绪（模式: ${currentMode}${modeSource === 'local' ? '，来自本地 mode.json 回退' : ''}）`);
         if (currentMode === 'reserved2') {
           // 首次确定模式为 reserved2 后再恢复持久化的有限睡眠定时器，
           // 避免在 initial chat 模式下设置定时器导致 timeout 唤醒被模式守卫吞掉。
@@ -2916,7 +2970,7 @@ async function main() {
         try { await flushQueue(); } catch (error) { log('补投队列异常:', error?.message ?? error); }
         // DSH 恢复后，把离线期间攒下的黑话学习窗口补触发
         for (const key of [...slangWindows.keys()]) maybeQueueSlangExtraction(key);
-      } else if (currentMode !== lastMode) {
+      } else if (modeSource === 'dsh' && currentMode !== lastMode) {
         if (lastMode === 'reserved' && currentMode !== 'reserved') {
           cleanupSocialForModeChange();
           log('桥接模式已离开一代仿真模式，清理社交状态');
@@ -2939,6 +2993,12 @@ async function main() {
     } else if (dshReady) {
       dshReady = false;
       log('⚠️ DSH 不可用（重启中？），QQ 消息将入队等待');
+      // 此时 refreshMode 读不到设置页，模式会退回本地 state/mode.json。把这件事明确打出来：
+      // 否则「模式无声降级」看起来就像机器人性格突然变了。
+      const localMode = readJsonSafe(path.join(STATE_DIR, 'mode.json'), null)?.mode;
+      if (localMode && VALID_MODES.includes(localMode)) {
+        log(`⚠️ DSH 不可用期间模式回退为本地设置: ${localMode}（DSH 设置页的值暂时读不到，恢复后会自动同步）`);
+      }
     }
   };
   function startDshWatch() {
@@ -2946,6 +3006,89 @@ async function main() {
     dshCheckStarted = true;
     checkDsh();
     setInterval(checkDsh, 5000);
+    startTurnWatchdog();
+  }
+
+  // 回合看门狗：DSH 重启会杀掉正在执行工具调用的 MCP 子进程，那样该回合永远等不到
+  // tool result，也就永远不会有 turn/end —— v2TurnStartAt / collectors 永不清理，
+  // isConversationBusyV2 于是永久为真（实测：一个 @ 被「会话繁忙」挡住后再也不会被唤醒）。
+  // 这里对超时回合做兜底：清掉回合跟踪并补一次积压唤醒。
+  const TURN_STALL_MS = 15 * 60 * 1000;
+  // prompt 投出后多久还没等到 turn/start 就认为 DSH 没接住（刚重启、MCP 还在注册时不接单）。
+  const PROMPT_PICKUP_MS = 2 * 60 * 1000;
+  // 清掉一个会话的卡死回合后，把积压的第一条唤醒原因重新排上（其余留在队列里等下一轮）。
+  function replayPendingWake(key) {
+    const st = getSocialV2State(key);
+    if (!Array.isArray(st.pendingWakeReasons) || !st.pendingWakeReasons.length) return;
+    const item = st.pendingWakeReasons.shift();
+    if (item && typeof item === 'object') {
+      log(`[reserved2] ${key} 补发卡死期间积压的唤醒：${item.reason}@seq${item.seq}`);
+      scheduleWakeV2(key, item.reason);
+    }
+  }
+  function startTurnWatchdog() {
+    const tick = () => {
+      const now = Date.now();
+      for (const [key, sid] of [...Object.entries(state.sessions)]) {
+        const startedAt = v2TurnStartAt.get(sid);
+        if (!startedAt || now - startedAt < TURN_STALL_MS) continue;
+        if (!isConversationBusyV2(key, getSocialV2State(key))) continue;
+        log(`[reserved2] ⚠️ 会话 ${key} 的回合已持续 ${Math.round((now - startedAt) / 60000)} 分钟仍未结束，按卡死处理：清理回合跟踪并补发积压唤醒`);
+        appendActivity(`${key} [reserved2] 回合超时 ${Math.round((now - startedAt) / 60000)} 分钟，已强制清理（可能是 DSH 重启打断了工具调用）`);
+        v2TurnStartAt.delete(sid);
+        collectors.delete(sid);
+        pendingWakeKeys.delete(key);
+        disarmPendingWakeLease(key);
+        sendToolSucceededSessions.delete(sid);
+        pendingSendToolCalls.delete(sid);
+        replayPendingWake(key);
+      }
+      // 另一种卡死：prompt 已经投给 DSH，但永远等不到结果（DSH 重启打断在途请求、或会话侧
+      // 回合没真正开始）。此时没有任何 turn 事件，v2TurnStartAt 是空的，上面那段看门狗管不到，
+      // 而 entry.running 永远为 true —— isConversationBusyV2 对所有唤醒返回真，该会话彻底哑掉。
+      for (const [key, entry] of [...promptQueues]) {
+        if (!entry || !entry.running) continue;
+        const startedAt = entry.startedAt;
+        if (!startedAt) continue;
+        if (promptQueues.get(key) !== entry) continue;
+        const sid = state.sessions[key];
+        // 两种卡死，判据不同：
+        //  A) 回合已经开始（收到过 turn/start）却迟迟不结束 —— DSH 重启打断工具调用的典型样子，
+        //     回合可能很长，给足 TURN_STALL_MS。
+        //  B) prompt 投出去了，但连 turn/start 都没等到 —— DSH 刚重启、MCP 还没注册完时不接单，
+        //     实测就是这样把整个群卡哑的。这种情况 2 分钟就能判定，越早重试越好。
+        const turnSeen = !!(sid && (v2TurnStartAt.has(sid) || collectors.has(sid)));
+        const limit = turnSeen ? TURN_STALL_MS : PROMPT_PICKUP_MS;
+        if (now - startedAt < limit) continue;
+        const mins = Math.max(1, Math.round((now - startedAt) / 60000));
+        log(turnSeen
+          ? `[reserved2] ⚠️ 会话 ${key} 的 prompt 已投出 ${mins} 分钟且回合迟迟不结束，按卡死处理：丢弃队列并补发积压唤醒`
+          : `[reserved2] ⚠️ 会话 ${key} 的 prompt 投出 ${mins} 分钟仍未等到 turn/start（DSH 没接住），重置后重试`);
+        appendActivity(turnSeen
+          ? `${key} [reserved2] prompt 投递超时 ${mins} 分钟，已强制清理`
+          : `${key} [reserved2] prompt 未被 DSH 接单 ${mins} 分钟，已重置重试`);
+        // 作废本 entry：先 +1 epoch，在途 await 的 finally 会因引用/epoch 不匹配而不再续跑队列。
+        promptQueueEpoch.set(key, (promptQueueEpoch.get(key) ?? 0) + 1);
+        const dropped = entry.queue.splice(0);
+        for (const it of dropped) {
+          try {
+            it.reject?.(new Error('prompt queue stalled and was reset'));
+          } catch {}
+        }
+        promptQueues.delete(key);
+        if (sid) {
+          v2TurnStartAt.delete(sid);
+          collectors.delete(sid);
+          sendToolSucceededSessions.delete(sid);
+          pendingSendToolCalls.delete(sid);
+        }
+        pendingWakeKeys.delete(key);
+        disarmPendingWakeLease(key);
+        replayPendingWake(key);
+      }
+    };
+    const timer = setInterval(tick, 60_000);
+    timer.unref?.();
   }
 
   // ── SnowLuma 上游健康：**连上了 ≠ 收得到** ──────────────────────────────────
@@ -3272,8 +3415,18 @@ async function main() {
       })();
       if (consoleToken && !tokenMatches) {
         if (req.method === 'GET' && url.pathname === '/') {
-          res.writeHead(401, { 'content-type': 'text/html; charset=utf-8', ...SECURITY_HEADERS });
-          res.end('<!doctype html><meta charset="utf-8"><title>需要令牌</title><script>const t=prompt(\'请输入控制台访问令牌\');if(t)location.href=\'/?token=\'+encodeURIComponent(t);</script>');
+          // 静态页面本身不含机密（真正的门在 /api 下的各接口上），所以这里仍然把页面给出去，
+          // 由前端显示「需要令牌」的输入条。
+          // 以前这里回 401 + 一段 prompt() 脚本：浏览器拦截弹窗（或用户点了"禁止再弹"）时，
+          // 弹窗静默失败 → 页面看起来正常但所有数据为空、所有按钮没反应。
+          // 注意：注释里不要写 "/api/" 加星号的写法 —— 那个星号会让测试里的
+          // "先剥块注释再剥行注释" 正则把 /* 当成块注释开头，吞掉后面几千行代码。
+          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', ...SECURITY_HEADERS });
+          try {
+            res.end(fs.readFileSync(path.join(ROOT, 'public', 'console.html'), 'utf8'));
+          } catch {
+            res.end('控制台页面缺失：qq-bridge/public/console.html');
+          }
         } else {
           sendJson({ ok: false, error: '未授权：请提供控制台访问令牌' }, 401);
         }
@@ -5150,6 +5303,7 @@ async function main() {
               return;
             }
           }
+          // 上游 v0.2.1-r1 已采纳同一修复（st/now 提到 try 之外），这里直接用上游版本。
           const st = getSocialV2State(key);
           const now = Date.now();
           try {
@@ -5165,8 +5319,8 @@ async function main() {
             for (let i = 0; i < messages.length; i++) st.sendTimes.push(now);
             if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
             const delays = computeGapsV2(messages, 'auto', undefined, undefined, sendCfg);
-            const sentMessages = await sendMessagesV2(key, messages, delays);
-            recordSentMessagesV2(key, sentMessages);
+            const { messages: sentMessages, ids: sentIds } = await sendMessagesV2(key, messages, delays);
+            recordSentMessagesV2(key, sentMessages, sentIds);
             st.lastAiReplyAt = now;
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
@@ -5180,7 +5334,7 @@ async function main() {
             sendJson({ ok: true, key, sent: sentMessages.length, failed: messages.length - sentMessages.length, ...(burstHint ? { hint: burstHint } : {}), ...(spaceWarn ? { warn: spaceWarn } : {}), ...(splitWarn ? { splitWarn } : {}) });
           } catch (error) {
             if (error?.sent?.length) {
-              recordSentMessagesV2(key, error.sent);
+              recordSentMessagesV2(key, error.sent, error.sentIds);
               log(`[reserved2] 工具分条发送部分成功 ${error.sent.length}/${messages.length} 条，已记录已发消息`);
             }
             // 失败/未发出的消息回滚预占的发送额度，避免假 429。
@@ -5314,8 +5468,8 @@ async function main() {
             actualReplyToMessageId = resolved.messageId;
           }
           try {
-            const sentMessages = await sendMessagesV2(key, messages, delays, actualReplyToMessageId, atUserId);
-            recordSentMessagesV2(key, sentMessages);
+            const { messages: sentMessages, ids: sentIds } = await sendMessagesV2(key, messages, delays, actualReplyToMessageId, atUserId);
+            recordSentMessagesV2(key, sentMessages, sentIds);
             st.lastAiReplyAt = now;
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
@@ -5329,7 +5483,7 @@ async function main() {
             sendJson({ ok: true, key, sent: sentMessages.length, failed: messages.length - sentMessages.length, delays, quoted: quotedInfo, ...(burstHint ? { hint: burstHint } : {}), ...(spaceWarn ? { warn: spaceWarn } : {}), ...(splitWarn ? { splitWarn } : {}) });
           } catch (error) {
             if (error?.sent?.length) {
-              recordSentMessagesV2(key, error.sent);
+              recordSentMessagesV2(key, error.sent, error.sentIds);
               log(`[reserved2] 工具统一发送部分成功 ${error.sent.length}/${messages.length} 条，已记录已发消息`);
             }
             // 失败/未发出的消息回滚预占的发送额度，避免假 429。
@@ -7000,6 +7154,7 @@ async function main() {
           // 曾整段踩过同型问题，见体检报告 #1 / R2）。后果不是"少一行日志"，而是
           // 失败响应变成「st is not defined」、额度不回滚（接下来一分钟全是假 429），
           // 且部分成功的已发消息不会被记进 recentMessages。
+          // 上游 v0.2.1-r1 已采纳同一修复。
           const st = getSocialV2State(key);
           const now = Date.now();
           try {
@@ -7013,8 +7168,8 @@ async function main() {
             }
             st.sendTimes.push(now);
             if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
-            const sentMessages = await sendMessagesV2(key, [message], [], actualReplyToMessageId, atUserId);
-            recordSentMessagesV2(key, sentMessages);
+            const { messages: sentMessages, ids: sentIds } = await sendMessagesV2(key, [message], [], actualReplyToMessageId, atUserId);
+            recordSentMessagesV2(key, sentMessages, sentIds);
             st.lastAiReplyAt = now;
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
@@ -7025,7 +7180,7 @@ async function main() {
             sendJson({ ok: true, key, sent: sentMessages.length, failed: sentMessages.length ? 0 : 1, quoted: quotedInfo });
           } catch (error) {
             if (error?.sent?.length) {
-              recordSentMessagesV2(key, error.sent);
+              recordSentMessagesV2(key, error.sent, error.sentIds);
               log(`[send] ${url.pathname} ${key} 部分成功 ${error.sent.length}/1 条，已记录已发消息`);
             }
             // 失败/未发出的消息回滚预占的发送额度，避免假 429。
@@ -7465,7 +7620,7 @@ async function main() {
     segments.push({ type: 'text', data: { text: escapeCqText(rawMessage) } });
     const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
     const params = kind === 'private' ? { user_id: Number(id), message: segments } : { group_id: Number(id), message: segments };
-    const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+    const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:2000').replace(/\/+$/, '');
     const res = await fetch(`${httpUrl}/${action}`, {
       method: 'POST',
       headers: {
@@ -7479,6 +7634,26 @@ async function main() {
     if (!res.ok || body.status !== 'ok' || body.retcode !== 0) {
       const hint = res.status === 426 ? '（HTTP 426：snowluma.httpUrl 可能指向了 WebSocket 端口，请检查 config.json 的 snowluma.httpUrl 是否为 OneBot HTTP API 地址）' : '';
       throw new Error(`OneBot ${action} 失败: ${body.wording || body.retcode || res.status}${hint}`);
+    }
+    return body.data;
+  }
+
+  // 通用 OneBot HTTP action 调用：onebotSend 专用于发消息，其余 action（如 delete_msg）走这里。
+  // 与 onebotSend 共用 accessToken 与错误语义，避免为每个 action 复制一份 fetch。
+  async function onebotCall(action, params = {}) {
+    const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:2000').replace(/\/+$/, '');
+    const res = await fetch(`${httpUrl}/${action}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
+      },
+      body: JSON.stringify(params ?? {}),
+      signal: AbortSignal.timeout(15000)
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.status !== 'ok' || body.retcode !== 0) {
+      throw new Error(`OneBot ${action} 失败: ${body.wording || body.retcode || res.status}`);
     }
     return body.data;
   }
@@ -7994,6 +8169,7 @@ async function main() {
     const assertSendAllowed = captureSendGuard(key);
     const [kind, id] = key.split(':');
     const sent = [];
+    const sentIds = []; // 与 sent 严格同下标（只记真正发成功的），供 /recall 与 AI 定位自己发的消息
     const failed = [];
     for (let i = 0; i < messages.length; i++) {
       const msg = messages[i];
@@ -8002,8 +8178,11 @@ async function main() {
       sendChain = sendChain
         .then(async () => {
           assertSendAllowed();
-          await onebotSend(kind, id, msg, useReply, useAt);
+          // onebotSend 返回 body.data（含 message_id），旧实现丢掉了；留一份给撤回功能。
+          const data = await onebotSend(kind, id, msg, useReply, useAt);
+          const mid = data?.message_id ?? data?.messageId ?? null;
           sent.push(msg);
+          sentIds.push(mid == null ? null : String(mid));
         })
         .catch((error) => {
           log(`QQ 发送失败 (${key}):`, error?.message ?? error);
@@ -8018,9 +8197,10 @@ async function main() {
       if (failed.length > 0) {
         const err = new Error(`QQ 发送失败 ${failed.length}/${messages.length} 条：${failed[0]?.message ?? '未知错误'}`);
         err.sent = sent.slice();
+        err.sentIds = sentIds.slice();
         throw err;
       }
-      return sent;
+      return { messages: sent, ids: sentIds };
     });
   }
 
@@ -8070,6 +8250,8 @@ async function main() {
   // 四种 QQ 模式共用 DSH 会话，统一强制使用多模态模型 DeepSeek-V41-Flash（id: deepseek-flash）；
   // 它同时支持 text/image 输入，取代已下线的 deepseek-v4-flash-vision-exp。
   const modelAppliedSessions = new Map(); // sessionId -> 已应用的 modelSelectionEpoch
+  // key -> 上次给 QQ 发「我卡了一下」的时间：报错提示要限流，但不能带任何原文
+  const errorNoticeAt = new Map();
   // 返回 'applied' | 'not-found' | 'failed'。
   // 'not-found' 表示 DSH 侧会话已经不存在（DSH 重启、异常退出、归档竞态），
   // 本地映射已失效，调用方必须退役重建，否则每条消息都会对着一个不存在的会话重试。
@@ -8444,10 +8626,46 @@ async function main() {
       };
       rememberAgentToken(key, st.agentToken);
       socialV2.conversations.set(key, st);
+      // 会话数上限：allow.private 为空 + allowAllWhenEmpty=true 时，任何陌生人私聊都会
+      // 新建一个持久化会话；不设上限则状态文件与「每条消息全量重写」的开销会无限增长。
+      evictSocialV2Conversations();
       scheduleProactiveCheckV2(key);
       setupSleepTimerV2(key);
     }
     return st;
+  }
+
+  // 上限与淘汰策略：只淘汰「没有未读、没有在途定时器、24 小时内无活动」的最老会话，
+  // 因此活跃会话永远不会被淘汰；淘汰时同步清理 token 与关联缓存，避免留下孤儿。
+  const SOCIAL_V2_MAX_CONVERSATIONS = 200;
+  function evictSocialV2Conversations() {
+    const over = socialV2.conversations.size - SOCIAL_V2_MAX_CONVERSATIONS;
+    if (over <= 0) return;
+    const now = Date.now();
+    const removable = [];
+    for (const [k, v] of socialV2.conversations) {
+      if (!v) continue;
+      if ((v.unread || []).length > 0) continue;
+      if (v.pendingWakeTimer || v.sleepTimer || v.replyCheckTimer || v.proactiveTimer) continue;
+      if (now - Number(v.lastWakeAt || 0) < 24 * 60 * 60 * 1000) continue;
+      if (now - Number(v.lastAiReplyAt || 0) < 24 * 60 * 60 * 1000) continue;
+      if (now - Number(v.lastIncomingAt || 0) < 24 * 60 * 60 * 1000) continue;
+      removable.push([k, v, Number(v.lastWakeAt || 0)]);
+    }
+    removable.sort((a, b) => a[2] - b[2]);
+    let removed = 0;
+    for (const [k, v] of removable) {
+      if (removed >= over) break;
+      clearSocialV2Timers(k);
+      if (v.agentToken) KNOWN_AGENT_TOKENS.delete(v.agentToken);
+      socialV2.conversations.delete(k);
+      seenForwardIds.delete(k);
+      messageMediaStore.delete(k);
+      wakeConfigMissCount.delete(k);
+      pendingWakeKeys.delete(k);
+      removed += 1;
+    }
+    if (removed > 0) log(`[reserved2] 会话状态超过上限 ${SOCIAL_V2_MAX_CONVERSATIONS}，已淘汰 ${removed} 个长期静默会话`);
   }
 
   function loadSocialV2State() {
@@ -9198,7 +9416,7 @@ async function main() {
     return new Promise((resolve, reject) => {
       let entry = promptQueues.get(key);
       if (!entry) {
-        entry = { queue: [], running: false };
+        entry = { queue: [], running: false, epoch: promptQueueEpoch.get(key) ?? 0 };
         promptQueues.set(key, entry);
       }
       entry.queue.push({ promptText, opts, resolve, reject });
@@ -9209,12 +9427,18 @@ async function main() {
   async function processPromptQueue(key) {
     const entry = promptQueues.get(key);
     if (!entry || entry.running) return;
+    // drain（reset / 模式切换）已把本 entry 作废：不得续跑、不得删除（可能已换新 entry）。
+    if ((entry.epoch ?? 0) !== (promptQueueEpoch.get(key) ?? 0)) return;
     const item = entry.queue.shift();
     if (!item) {
-      if (entry.queue.length === 0) promptQueues.delete(key);
+      // 只在仍是同一个 entry 时删除：drainPromptQueue 可能在 await 期间把本 entry 摘掉
+      // 并建了新 entry，按 key 盲删会误删新的那个。
+      if (entry.queue.length === 0 && promptQueues.get(key) === entry) promptQueues.delete(key);
       return;
     }
     entry.running = true;
+    // 记录本条的投递起点：看门狗据此判断「prompt 已投出但永远等不到结果」的卡死。
+    entry.startedAt = Date.now();
     try {
       const result = await deliverPromptNow(key, item.promptText, item.opts);
       item.resolve(result);
@@ -9222,8 +9446,10 @@ async function main() {
       item.reject(error);
     } finally {
       entry.running = false;
-      if (promptQueues.get(key) === entry) {
-        if (entry.queue.length) processPromptQueue(key);
+      // 重新取当前 entry：期间可能已被 drain 掉或换了新的，按老的引用续跑会串台。
+      const cur = promptQueues.get(key);
+      if (cur === entry) {
+        if (cur.queue.length) processPromptQueue(key);
         else promptQueues.delete(key);
       }
     }
@@ -9910,14 +10136,17 @@ async function main() {
     return msg;
   }
 
-  function recordSentMessagesV2(key, messages) {
+  function recordSentMessagesV2(key, messages, messageIds = null) {
     const st = getSocialV2State(key);
     const now = Date.now();
     const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
     const list = Array.isArray(messages) ? messages : [];
+    const ids = Array.isArray(messageIds) ? messageIds : [];
     for (let i = 0; i < list.length; i++) {
       const text = redactKnownTokensOnly(String(list[i] ?? '')).slice(0, 200);
       st.recentMessages.push({
+        // messageId：用于 /recall 定位「自己刚发的那条」，AI 也能从 qq_get_my_recent_messages 看到
+        messageId: ids[i] != null ? String(ids[i]) : null,
         sender: '我',
         text,
         plain: text,
@@ -10804,11 +11033,16 @@ async function main() {
     for (const item of entry.queue) item.reject(new Error(errorMsg));
     entry.queue = [];
     promptQueues.delete(key);
+    // 每次 drain 让所有已存在（含在途）的 entry 失效：它们在 await 结束后不会再续跑或
+    // 删除，避免与 reset 之后新建的 entry 互相踩踏——否则同一会话的 prompt 串行化会永久
+    // 失效，依赖顺序的记账（静默名额/退场标记/唤醒收尾）随之错配。
+    promptQueueEpoch.set(key, (promptQueueEpoch.get(key) ?? 0) + 1);
   }
 
   function drainAllPromptQueues(errorMsg) {
-    for (const [, entry] of promptQueues) {
+    for (const [key, entry] of promptQueues) {
       for (const item of entry.queue) item.reject(new Error(errorMsg));
+      promptQueueEpoch.set(key, (promptQueueEpoch.get(key) ?? 0) + 1);
     }
     promptQueues.clear();
   }
@@ -10829,7 +11063,11 @@ async function main() {
     // textContent 带引用对象信息，供 DSH 判断“这句话在对谁说”；
     // plainContent 只保留当前消息自己的文字，用于命令/指向性判断，避免被引用原文干扰。
     const textContent = await segmentsToText(event.message ?? [], { resolveAtName, resolveReply });
-    const plainContent = await segmentsToText(event.message ?? [], { resolveAtName, includeReply: false });
+    // 群里发管理命令通常写成「@机器人 /recall」——segmentsToText 会把 at 段渲染成
+    // "@昵称" 拼在最前面，那样 plainContent 就不再以 '/' 开头，命令块永远匹配不到。
+    // 这里统一剥掉开头的 @提及（可带空白），让 @机器人 /xxx 与 /xxx 等价。
+    const rawPlain = await segmentsToText(event.message ?? [], { resolveAtName, includeReply: false });
+    const plainContent = String(rawPlain ?? '').replace(/^(?:@\S+\s*)+(?=\/)/, '').trim();
     const mediaList = extractMediaFromSegments(event.message ?? []);
     const messageRef = String(event.message_id ?? event.msg_id ?? event.message_seq ?? '');
     const seqRef = event.message_seq != null ? String(event.message_seq) : '';
@@ -10965,6 +11203,77 @@ async function main() {
       if (plainContent === '/active' || plainContent === '/speak') {
         writeRoleState(roleState.role, 'active');
         await sendToQQ(key, '已退出静默模式，恢复正常回复。');
+        return;
+      }
+      // /recall [序号] —— 撤回机器人自己发过的消息（仅管理员，桥接直接执行）。
+      // 只允许撤回 isSelf=true 的记录（QQ 侧本就只能撤回自己的消息），提前拒绝可避免
+      // 把「撤回失败」误当成成功；成功后同步从 recentMessages 摘除，避免 AI 以为还在。
+      if (plainContent === '/recall' || plainContent === '/undo' || plainContent.startsWith('/recall ') || plainContent.startsWith('/undo ')) {
+        const cooldownMs = 3000;
+        const last = recallCooldownAt.get(key) ?? 0;
+        const sinceLast = Date.now() - last;
+        if (sinceLast < cooldownMs) {
+          await sendToQQ(key, `撤回太频繁，请 ${Math.ceil((cooldownMs - sinceLast) / 1000)} 秒后再试。`);
+          return;
+        }
+        const st = getSocialV2State(key);
+        const recent = Array.isArray(st.recentMessages) ? st.recentMessages : [];
+        const ownIndexes = [];
+        for (let i = 0; i < recent.length; i++) {
+          if (recent[i] && recent[i].isSelf && recent[i].messageId) ownIndexes.push(i);
+        }
+        const arg = plainContent.replace(/^\/(?:recall|undo)\s*/, '').trim();
+        let target = null;
+        if (!arg) {
+          if (ownIndexes.length > 0) target = recent[ownIndexes[ownIndexes.length - 1]];
+        } else if (/^\d+$/.test(arg)) {
+          const n = Number(arg);
+          if (n >= 1 && n <= ownIndexes.length) target = recent[ownIndexes[ownIndexes.length - n]];
+        } else if (/^-?[1-9]\d*$/.test(arg)) {
+          target = recent.find((m) => m && m.isSelf && String(m.messageId) === arg) ?? null;
+          if (!target) {
+            await sendToQQ(key, `拒绝撤回：消息 id ${arg} 不是机器人自己发过的消息。`);
+            return;
+          }
+        } else {
+          await sendToQQ(key, '用法：/recall 撤回机器人最近发的一条；/recall 2 撤回倒数第二条；也可直接给 message_id。');
+          return;
+        }
+        if (!target) {
+          await sendToQQ(key, '拒绝撤回：找不到可撤回的目标（消息太旧，或所在会话已被重置）。');
+          return;
+        }
+        const mid = String(target.messageId);
+        if (!/^-?[1-9]\d*$/.test(mid)) {
+          await sendToQQ(key, '拒绝撤回：该条消息没有有效的 message id。');
+          return;
+        }
+        try {
+          await onebotCall('delete_msg', { message_id: Number(mid) });
+        } catch (error) {
+          // QQ 侧只允许撤回自己发送的、且未超过时限的消息；retcode=100 是最常见的拒绝。
+          // 原始报错只写日志，别把 OneBot 的错误串原样发到群里（可能是群，不是私聊）。
+          const msg = String(error?.message ?? error);
+          log(`[recall] 撤回失败 (${key}): ${msg.slice(0, 300)}`);
+          const hint = /retcode=100|not retractable|message not found/i.test(msg)
+            ? '（QQ 只允许撤回自己发送的、且未超过时限的消息）'
+            : '';
+          await sendToQQ(key, `撤回失败${hint}`);
+          return;
+        }
+        recallCooldownAt.set(key, Date.now());
+        const idx = recent.indexOf(target);
+        if (idx >= 0) {
+          const removed = recent.splice(idx, 1)[0];
+          if (removed?.messageId) {
+            seenForwardIds.delete(`${key}:${String(removed.messageId)}`);
+            messageMediaStore.delete(`${key}:${String(removed.messageId)}`);
+          }
+          saveSocialV2State();
+        }
+        appendActivity(`${key} 管理员撤回了一条机器人消息（id=${mid}）`);
+        log(`[recall] ${key} 已撤回消息 id=${mid}`);
+        await sendToQQ(key, '已撤回。');
         return;
       }
       // 其余 / 开头内容照常发给 DSH（DSH 的斜杠命令原样执行，如 /model）
@@ -11670,11 +11979,20 @@ async function main() {
                 }
               } else if (ended.reason.kind === 'error') {
                 const msg = ended.reason.error?.message ?? '未知错误';
+                // 上游 v0.2.1-r1 补了本地日志（PR #24），但**仍然把报错原文发到 QQ**；
+                // 我们保留本地偏离：原始报错【绝不】转发到 QQ —— 里面常带模型名、
+                // request_id、配额、网关地址等内部信息，等于当着全群自证技术细节。
+                // 2026-09-24 中午就把 "The supported API model names are deepseek-flash,
+                // deepseek-v4-pro, but you passed deepseek-v41-flash" 原样发进了群，
+                // 还被群友引用追问。原文只进本地日志/活动记录，QQ 侧最多每分钟一句
+                // 不含任何技术信息的话。
                 const safeMsg = shouldAuditKey(key) && SENSITIVE_RE.test(msg) ? '（含敏感信息，已隐藏）' : msg.slice(0, 500);
-                // 以前这里只发 QQ、不写日志：出问题时 bridge.log 里什么都没有，排查只能靠猜（PR #24）。
                 log(`⚠️ agent 处理出错 (${key})：${safeMsg}`);
-                appendActivity(`${key} agent 处理出错：${safeMsg.slice(0, 80)}`);
-                await sendToQQ(key, `⚠️ agent 处理出错：${safeMsg}`);
+                appendActivity(`${key} agent 处理出错（原文只在日志里，未外发）`);
+                if (Date.now() - (errorNoticeAt.get(key) ?? 0) > 60_000) {
+                  errorNoticeAt.set(key, Date.now());
+                  await sendToQQ(key, '啊，我这边卡了一下，等下再试');
+                }
                 if (isFarewell) {
                   const st = socialState(key);
                   if (st.phase === 'exiting') {

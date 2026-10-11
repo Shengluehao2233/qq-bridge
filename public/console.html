@@ -1758,6 +1758,19 @@ button:active:not(:disabled) {
 </style>
 </head>
 <body>
+  <!-- 未授权提示条。控制台所有数据都来自 /api/*，而这些接口需要 console token。
+       上游在这里走的是「401 + prompt()」：浏览器拦截弹窗（或用户勾了"禁止再弹"）时
+       prompt 静默失败，表现成「页面能打开但面板全空、按钮点了没反应」，而且每 3 秒
+       重发十几个请求全 401，DevTools 里一片红。改成页面内可见、可恢复的提示条。 -->
+  <div id="authBar" style="display:none;margin:12px;padding:10px 12px;border:1px solid var(--err,#c0392b);border-radius:8px;background:#2a1a1a">
+    <b class="err">需要控制台令牌</b>
+    <span class="meta">下面所有面板都是空的、按钮都没反应，就是因为这里还没通过鉴权（接口全部返回 401）。</span>
+    <div class="row" style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <input type="password" id="authBarInput" placeholder="粘贴控制台令牌（完整值在 qq-bridge\state\console-token）" style="min-width:320px" autocomplete="new-password">
+      <button id="authBarSave" class="small">保存并重新加载</button>
+      <span class="meta" id="authBarMsg"></span>
+    </div>
+  </div>
   <div class="bg-decor" aria-hidden="true"></div>
   <a class="skip-link" href="#mainContent">跳到主要内容</a>
   <aside class="sidebar" aria-label="控制台导航">
@@ -2639,36 +2652,80 @@ button:active:not(:disabled) {
   <noscript><div class="connection-alert">控制台需要启用 JavaScript 才能加载状态及保存设置。</div></noscript>
 
 <script>
+// localStorage 在浏览器禁用存储/隐私策略下会直接抛异常。上游脚本顶部一抛，
+// 整个 <script> 就中止，api()/refresh()/所有按钮监听统统没定义 ——
+// 表现正好是"页面能打开、面板全空、按钮点了没反应"。所以统一包一层。
+function lsGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
+function lsSet(k, v) { try { localStorage.setItem(k, v); return true; } catch { return false; } }
+function lsDel(k) { try { localStorage.removeItem(k); } catch {} }
+
+// 一旦确认未授权就停止一切轮询：否则页面每 3 秒重发十几个请求，
+// 每个都 401，DevTools 里就是一片红色。填对令牌后 authBlocked 复位、整体重载。
+let authBlocked = false;
+
 (function () {
   // 如果通过 ?token= 进入（控制台启用鉴权时根路径会重定向带 token），存到 localStorage
-  const qs = new URLSearchParams(location.search);
-  const token = qs.get('token');
-  if (token) {
-    localStorage.setItem('consoleToken', token);
-    history.replaceState({}, '', location.pathname + location.hash);
-  }
+  try {
+    const qs = new URLSearchParams(location.search);
+    const token = qs.get('token');
+    if (token) {
+      lsSet('consoleToken', token);
+      history.replaceState({}, '', location.pathname + location.hash);
+    }
+  } catch (error) { console.warn('控制台令牌初始化失败', error); }
 })();
 
-async function api(path, method, body, _retried = 0) {
+async function api(path, method, body) {
+  if (authBlocked) throw new Error('未授权：等令牌填写完成');
   const headers = body ? {'content-type':'application/json'} : {};
-  const token = localStorage.getItem('consoleToken');
+  const token = lsGet('consoleToken');
   if (token) headers['x-console-token'] = token;
   const res = await fetch(path, { method: method || 'GET', headers, body: body ? JSON.stringify(body) : undefined });
   if (res.status === 401) {
-    if (_retried >= 2) {
-      localStorage.removeItem('consoleToken');
-      throw new Error('未授权');
-    }
-    const t = prompt('请输入控制台访问令牌：');
-    if (t) {
-      localStorage.setItem('consoleToken', t.trim());
-      return api(path, method, body, _retried + 1);
-    }
-    localStorage.removeItem('consoleToken');
-    throw new Error('未授权');
+    // 不再用 prompt()：弹窗被浏览器拦截时会静默失败，于是每个请求都 401、
+    // 每个按钮的 await 直接抛错 → "点了没反应"。
+    authBlocked = true;
+    showAuthBar('令牌无效或已过期，请重新填写。');
+    const err = new Error('未授权：控制台令牌无效或缺失（见页面顶部提示条）');
+    err.unauthorized = true;
+    throw err;
   }
   return res.json();
 }
+// ── 页面内令牌提示条（替代上游的 prompt()）───────────────────────────────
+function showAuthBar(msg) {
+  const bar = document.getElementById('authBar');
+  if (!bar) return;
+  bar.style.display = '';
+  const m = document.getElementById('authBarMsg');
+  if (m && msg) { m.textContent = msg; m.className = 'meta err'; }
+}
+function hideAuthBar() {
+  const bar = document.getElementById('authBar');
+  if (bar) bar.style.display = 'none';
+}
+async function applyConsoleToken() {
+  const input = document.getElementById('authBarInput');
+  const msg = document.getElementById('authBarMsg');
+  const t = String(input?.value ?? '').trim();
+  if (!t) { if (msg) { msg.textContent = '请先填入令牌'; msg.className = 'meta err'; } return; }
+  lsSet('consoleToken', t);
+  try {
+    const res = await fetch('/api/status', { headers: { 'x-console-token': t } });
+    if (res.status === 401) throw new Error('桥接拒绝了该令牌');
+    if (!res.ok) throw new Error('桥接返回 ' + res.status);
+    authBlocked = false;
+    hideAuthBar();
+    if (msg) { msg.textContent = '✅ 已连接'; msg.className = 'meta ok'; }
+    initConsole();
+  } catch (error) {
+    lsDel('consoleToken');
+    authBlocked = true;
+    if (msg) { msg.textContent = '❌ 失败：' + (error?.message ?? error) + '（桥接没跑时也会这样）'; msg.className = 'meta err'; }
+  }
+}
+document.getElementById('authBarSave').addEventListener('click', () => { void applyConsoleToken(); });
+document.getElementById('authBarInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') void applyConsoleToken(); });
 function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 // 上游静默时长的人话渲染：只用于 SnowLuma 健康提示（秒 / 分钟 / 小时）。
 function fmtAgoMs(ms) {
@@ -4414,7 +4471,7 @@ async function changeConsoleToken(generate) {
     return;
   }
   // 保存到 localStorage，当前页面继续使用新令牌
-  localStorage.setItem('consoleToken', r.token);
+  lsSet('consoleToken', r.token);
   input.value = r.token;
   msg.textContent = r.generated ? '已生成随机令牌，当前页面已自动使用。可点击显示后复制。' : '已保存新令牌';
   msg.className = 'meta ok';
@@ -5047,10 +5104,24 @@ document.getElementById('usageClear').addEventListener('click', async () => {
 
 setConsolePage(location.hash.slice(1), { updateHash:false });
 
-refresh(); refreshRoles(); refreshWhitelist(); refreshSessions(); refreshPending(); refreshPresets(); loadSocialForm(); loadV2Config(); refreshV2Activity(); loadV2ToolLog(); loadV2SessionOptions(); refreshSocialStatus(); refreshSlang(); loadSlangConfig(); loadSecurity(); refreshSimPrompt(); refreshDshModel(); refreshUsage(); refreshUsageChart(); refreshUsageRecent();
-setInterval(() => { refresh(); refreshSessions(); refreshPending(); refreshSocialStatus(); refreshSlang(); }, 3000);
+// 首屏加载抽成函数：令牌提示条验证成功后会再调一次，整体重新拉取
+function initConsole() {
+  if (authBlocked) return;
+  refresh(); refreshRoles(); refreshWhitelist(); refreshSessions(); refreshPending(); refreshPresets(); loadSocialForm(); loadV2Config(); refreshV2Activity(); loadV2ToolLog(); loadV2SessionOptions(); refreshSocialStatus(); refreshSlang(); loadSlangConfig(); loadSecurity(); refreshSimPrompt(); refreshDshModel(); refreshUsage(); refreshUsageChart(); refreshUsageRecent();
+}
+if (!lsGet('consoleToken')) {
+  // 本来就没有令牌：只显示提示条，一个接口都不发（免得 DevTools 里一片 401）
+  authBlocked = true;
+  showAuthBar('本机浏览器里还没有保存过控制台令牌，填一次即可（浏览器会记住）。');
+} else {
+  initConsole();
+}
+setInterval(() => {
+  if (authBlocked) return;
+  refresh(); refreshSessions(); refreshPending(); refreshSocialStatus(); refreshSlang();
+}, 3000);
 // 用量看板只在本页可见时轮询：既保证「实时」，又不让其它页白白多打两份接口。
-setInterval(() => { if (currentConsolePage !== 'usage') return; refreshUsage(); refreshUsageChart(); refreshUsageRecent(); }, 3000);
+setInterval(() => { if (authBlocked || currentConsolePage !== 'usage') return; refreshUsage(); refreshUsageChart(); refreshUsageRecent(); }, 3000);
 // 主题切换（纯前端，不发任何请求；选择写入 localStorage，未选择时跟随系统）
 (function () {
   var root = document.documentElement;
