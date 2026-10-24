@@ -29,6 +29,8 @@
     "test-slang": "node scripts/test-slang-learn.mjs",
     "test-stickers": "node scripts/test-stickers.mjs",
     "test-voice": "node scripts/test-voice.mjs",
+    "tts": "node scripts/tts.mjs",
+    "test-tts": "node scripts/test-tts.mjs",
     "test-voice:gui": "node scripts/test-voice-gui.mjs",
     "test-voice:system": "node scripts/test-voice-system.mjs",
     "test-encoding": "node scripts/test-encoding.mjs",
