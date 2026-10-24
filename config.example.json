@@ -275,5 +275,46 @@
     "maxTokens": 4096,
     "maxResults": 8,
     "timeoutMs": 35000
+  },
+  "tts": {
+    "enabled": false,
+    "provider": "edge",
+    "maxChars": 200,
+    "outputDir": "audio/tts",
+    "timeoutMs": 60000,
+    "providers": {
+      "edge": {
+        "voice": "zh-CN-XiaoyiNeural",
+        "rate": "+0%",
+        "pitch": "+0Hz",
+        "volume": "+0%",
+        "python": ""
+      },
+      "openai": {
+        "apiKey": "",
+        "baseUrl": "https://api.openai.com/v1",
+        "model": "gpt-4o-mini-tts",
+        "voice": "alloy",
+        "format": "mp3",
+        "instructions": ""
+      },
+      "azure": {
+        "apiKey": "",
+        "region": "",
+        "voice": "zh-CN-XiaoxiaoNeural",
+        "outputFormat": "audio-24khz-48kbitrate-mono-mp3",
+        "style": "",
+        "rate": "+0%",
+        "pitch": "+0Hz"
+      },
+      "siliconflow": {
+        "apiKey": "",
+        "baseUrl": "https://api.siliconflow.cn/v1",
+        "model": "FunAudioLLM/CosyVoice2-0.5B",
+        "voice": "FunAudioLLM/CosyVoice2-0.5B:alex",
+        "format": "mp3",
+        "speed": 1
+      }
+    }
   }
 }
