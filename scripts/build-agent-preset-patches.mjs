@@ -144,14 +144,20 @@ export function renderPatch(name) {
 /** 生成（或校验）全部 patch 文件。@returns {{file:string,changed:boolean}[]} */
 export function buildPatches({ check = false, log = () => {} } = {}) {
   const results = [];
+  // 换行符不算漂移：renderPatch() 产出的是 LF，而 git 在本机（core.autocrlf）会在
+  // checkout 时把仓库里的文件写成 CRLF —— 逐字节比较就会把「刚 checkout 干净树」
+  // 误报成「与仓库源不一致」。2026-10-24 真踩过：verify:adaptation 因此多出 2 条假失败。
+  // 比较前统一成 LF；写入时反过来沿用目标文件原有的换行风格，避免无谓的 git 噪音。
+  const toLF = (s) => s.replace(/\r\n/g, '\n');
   for (const name of PRESETS) {
     const file = patchFileFor(name);
     const content = renderPatch(name);
     const current = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
-    const changed = current !== content;
+    const changed = current === null || toLF(current) !== toLF(content);
     if (changed && !check) {
+      const eol = current !== null && /\r\n/.test(current) ? '\r\n' : '\n';
       fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.writeFileSync(file, content, 'utf8');
+      fs.writeFileSync(file, eol === '\n' ? content : content.replace(/\n/g, '\r\n'), 'utf8');
     }
     log(`${changed ? (check ? '✗ 需重新生成' : '✓ 已生成') : '· 已是最新'} ${path.relative(REPO_ROOT, file)}`);
     results.push({ file, changed });

@@ -48,6 +48,18 @@ const DSH_MODULES = dshModulesDir();
 // 与 scripts/dsh-modules.mjs 的 dshHome() 保持同一口径。
 const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
 const BASE = process.env.DSH_BASE_URL || 'http://127.0.0.1:3080';
+// 防呆（2026-10-24 真踩过，白查一轮）：DSH_HOME 指向 qq 实例（~/.dsh-qq）却忘了设
+// DSH_BASE_URL 时，BASE 还是默认 3080 —— 那是**桌面那个 DSH**，验出来的
+// 「preset 没注册 / 没有 qq-mode 命名空间 / agent-preset/not-found」全是假失败，
+// 而且看起来跟真故障一模一样。这里在大声警告的同时把目标打印出来。
+const defaultHome = path.resolve(path.join(os.homedir(), '.dsh'));
+if (path.resolve(DSH_HOME) !== defaultHome && process.env.DSH_BASE_URL === undefined) {
+  console.warn(
+    `⚠️  DSH_HOME=${DSH_HOME}（非默认 ~/.dsh）但没设 DSH_BASE_URL ⇒ 正要去验 ${BASE}。\n`
+    + `    如果 qq 实例不在 3080，这个结果不可信：先 $env:DSH_BASE_URL="http://127.0.0.1:3082" 再跑。`,
+  );
+}
+console.log(`▶ 目标 DSH: ${BASE}（DSH_HOME=${DSH_HOME}）`);
 
 let pass = 0, fail = 0;
 const results = [];
