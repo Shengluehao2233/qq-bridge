@@ -88,8 +88,9 @@ const LOCAL_EXECUTION_TOOLS = [
   'subagent_codex', 'subagent_claude_code',
 ];
 
-/** 0.2.1 起 Codex / Claude Code 改为按需安装：这组名字默认扫不到，不算拼错假名。 */
-const OPTIONAL_BUNDLE_TOOLS = new Set(['subagent_codex', 'subagent_claude_code']);
+// 「可选项」名单不在这里复制一份：唯一来源是守卫自己导出的
+// OPTIONAL_BUNDLE_TOOL_NAMES（见 plugins/qq-agent-presets/qq-tool-restrict.mjs），
+// 否则两份名单迟早各自漂移——历史上正是这种复制让 7 个名字从没被断言过。
 
 /**
  * 工具名 → 真实存在与否。抽取实现在 `scripts/dsh-tool-names.mjs`（唯一实现，
@@ -219,8 +220,10 @@ test('守卫名单里的每个名字都是 DSH 真实注册的工具（防拼错
   for (const id of SIMULATION_PRESETS) {
     const { dir } = readPreset(id);
     const mod = await import(pathToFileURL(path.join(dir, 'qq-tool-restrict.mjs')).href);
+    // 可选项名单直接取守卫导出的那一份（不再本地复制，见文件顶部说明）。
+    const optional = new Set(mod.OPTIONAL_BUNDLE_TOOL_NAMES ?? []);
     const fabricated = mod.RESTRICTED_TOOL_NAMES
-      .filter((n) => !DEV_TOOL_PREFIX.test(n) && !OPTIONAL_BUNDLE_TOOLS.has(n) && !dshNames.has(n));
+      .filter((n) => !DEV_TOOL_PREFIX.test(n) && !optional.has(n) && !dshNames.has(n));
     assert.deepEqual(fabricated, [],
       `${id}: 以下名字在 DSH 已安装的工具包里找不到 ⇒ restrict 会抛错并被吞掉，`
       + `限制静默失效：${fabricated.join(', ')}`);

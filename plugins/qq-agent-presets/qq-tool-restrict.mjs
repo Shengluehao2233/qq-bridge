@@ -181,6 +181,12 @@ const LOCAL_EXECUTION_TOOLS = [
 export const OPTIONAL_BUNDLE_TOOL_NAMES = Object.freeze([
   'subagent_codex',
   'subagent_claude_code',
+  // dsh-plugin-guard 提供（可选 bundle，本机 profile 没装）。上游要求这三个名字
+  // 必须在守卫名单里，所以不能删；本机启动日志里那三行
+  // `skip restrict <name>: unknown global tool` 是预期噪音，不是 bug。
+  'dsh_snapshot',
+  'dsh_rollback',
+  'incident_resolved',
 ])
 
 const KNOWN_DANGEROUS_GLOBAL_TOOLS = [
