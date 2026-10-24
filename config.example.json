@@ -230,7 +230,11 @@
       "defaultVolume": 1,
       "loudness": "normal",
       "ffmpegPath": "",
-      "autoReadback": true
+      "autoReadback": true,
+      "speak": {
+        "maxChars": 250,
+        "minIntervalMs": 60000
+      }
     },
     "proactive": {
       "enabled": true,
@@ -279,6 +283,7 @@
   "tts": {
     "enabled": false,
     "provider": "edge",
+    "locale": "",
     "maxChars": 200,
     "outputDir": "audio/tts",
     "timeoutMs": 60000,

@@ -36,7 +36,9 @@ async function cleanupSelfTestSession() {
 }
 
 async function main() {
-  const baseUrl = process.argv[2] ?? 'http://127.0.0.1:3080';
+  // 默认打本项目专用的 3082（这台机器上 3080 是桌面版 DSH，链接/会话都不是这套配置）。
+  // 需要测别的实例时显式传参数：node src/self-test.js http://127.0.0.1:3080
+  const baseUrl = process.argv[2] ?? process.env.DSH_BASE_URL ?? 'http://127.0.0.1:3082';
   let auth;
   try {
     const cfg = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8'));

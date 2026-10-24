@@ -28,6 +28,8 @@ import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } fro
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
 import { resolvePriceTable } from './model-prices.js';
+// TTS（文字转语音）：合成逻辑全在 src/tts/，桥接只负责「谁在什么时候让谁说」。
+import { synthesize as ttsSynthesize, prepareText as ttsPrepareText, normalizeLocale as ttsNormalizeLocale, resolveVoice as ttsResolveVoice, listVoices as ttsListVoices, LOCALE_VOICES, TtsError } from './tts/index.js';
 import { createTokenLedger } from './token-ledger.js';
 import {
   loadSlang,
@@ -67,6 +69,9 @@ const SOCIAL_V2_FILE = path.join(STATE_DIR, 'social-v2.json');
 // 单独一个文件：它属于操作者配置，不能随 social-v2.json 的会话状态一起被重置清掉。
 const INITIAL_PROMPTS_FILE = path.join(STATE_DIR, 'initial-prompts.json');
 const STICKER_FILE = path.join(STATE_DIR, 'stickers.json');
+// 语音发送的运行时开关/音色/语种（管理员命令写入）。config.json 是"出厂值"，
+// 这里是"当前值"，重启桥接后仍然生效。
+const VOICE_STATE_FILE = path.join(STATE_DIR, 'voice-state.json');
 const FEEDBACK_FILE = path.join(STATE_DIR, 'feedback.json');
 const TOOL_LOG_FILE = path.join(STATE_DIR, 'tool-calls.jsonl');
 const TOKEN_USAGE_FILE = path.join(STATE_DIR, 'token-usage.jsonl');
@@ -672,6 +677,20 @@ function sanitizeRoleName(name) {
   return String(name ?? '').replace(/[^\w\u4e00-\u9fff-]/g, '');
 }
 
+// 语音运行时状态：{ enabled?: boolean, provider?, voice?, locale? }。
+// 只存「管理员改过的东西」，没改过的字段继续用 config.json。
+function readVoiceState() {
+  return readJsonSafe(VOICE_STATE_FILE, {});
+}
+function writeVoiceState(patch) {
+  const cur = readVoiceState();
+  const next = { ...cur, ...(patch ?? {}) };
+  // 空字符串 = 清掉该字段（回到 config 的值），存成 null 更明确。
+  for (const k of Object.keys(next)) if (next[k] === '' || next[k] === undefined) delete next[k];
+  atomicWriteJson(VOICE_STATE_FILE, next);
+  return next;
+}
+
 // 管理员 QQ（ownerQQ）规范化：空值=未设置；必须是正整数 QQ 号。
 function normalizeOwnerQQ(value) {
   if (value === undefined || value === null) return null;
@@ -792,6 +811,16 @@ function loadConfig() {
       longGapMinMs: 2500,             // 长间隔下限（当前控制台保存值）
       longGapMaxMs: 5000,             // 长间隔上限（当前控制台保存值）
       ...(file.social ?? {})
+    },
+    // TTS（文字转语音）：合成逻辑全在 src/tts/ 里，这里只是「出厂值」。
+    // 管理员用 /语音 音色、/语音 语种 改过的值存 state/voice-state.json，会覆盖这里。
+    // 字段说明见 docs/guides/TTS.md。
+    tts: {
+      enabled: false,
+      provider: 'edge',
+      locale: '',
+      maxChars: 200,
+      ...(file.tts ?? {})
     },
     socialV2: {
       enabled: true,
@@ -1583,6 +1612,9 @@ async function main() {
   //                  但仍强制白名单 + 语音限流 + 敏感词审计。
   // 语音发送时间戳（scopeKey → number[]）：与文本发送分开计数，语音额度独立。
   const voiceSendTimes = new Map();
+  // 「说一句话」的限流（每会话最多 1 条/分钟，见 voiceCfg().speak）。与上面分开：
+  // 发库里的音频和临时合成是两种动作，额度互不侵占。
+  const voiceSpeakAt = new Map();
 
   /**
    * 出站语音的内容审计：与文本一致，凡是「疑似敏感信息 / 含会话令牌」的**文件名**
@@ -1598,10 +1630,31 @@ async function main() {
     }
   }
 
+  /**
+   * 「说一句话」的文本审计：这段文字会被**送出本机**（edge-tts 走微软服务器、
+   * 其他 provider 走各自 API），所以比本地发送更严格 —— 路径、凭据、会话令牌、
+   * 内网地址这类东西一旦被念出来就是二次泄露，直接拦在合成之前。
+   *
+   * 语音的音频内容本身没法事后审计（发出去就是一串声音），所以这里必须前置。
+   */
+  function assertSpeakTextOk(key, text) {
+    const body = String(text ?? '').trim();
+    if (!body) throw new Error('要念的内容是空的');
+    const hasKnownToken = [...KNOWN_AGENT_TOKENS].some((t) => t && body.includes(t));
+    if (shouldAuditKey(key) && (SENSITIVE_RE.test(body) || hasKnownToken)) {
+      log(`⚠️ 语音合成被安全策略拦截 (${key})：要念的文本${hasKnownToken ? '含会话令牌' : '疑似含敏感信息'}`);
+      appendActivity(`${key} [tts] 合成被拦截（文本疑似敏感信息${hasKnownToken ? '/会话令牌' : ''}）`);
+      throw new Error('这段文字疑似包含路径/凭据/会话令牌，语音合成会把原文发给 TTS 服务商，已阻止');
+    }
+  }
+
   function voiceCfg() {
     const v = cfg.socialV2?.voice ?? {};
+    // 管理员命令写入的「当前值」覆盖 config.json 的出厂值。
+    const ov = readVoiceState();
+    const speakRaw = (v.speak && typeof v.speak === 'object') ? v.speak : {};
     return {
-      enabled: v.enabled !== false,
+      enabled: typeof ov.enabled === 'boolean' ? ov.enabled : v.enabled !== false,
       dir: path.resolve(ROOT, String(v.dir ?? 'audio')),
       maxSeconds: Number(v.maxSeconds) > 0 ? Number(v.maxSeconds) : 300,
       maxBytes: Number(v.maxBytes) > 0 ? Number(v.maxBytes) : 20 * 1024 * 1024,
@@ -1611,8 +1664,32 @@ async function main() {
       defaultVolume: Number(v.defaultVolume) > 0 ? Number(v.defaultVolume) : 1,
       loudness: v.loudness || 'normal',
       ffmpegPath: process.env.FFMPEG_PATH || v.ffmpegPath || null,
-      autoReadback: v.autoReadback !== false
+      autoReadback: v.autoReadback !== false,
+      // 「说一句话」的闸门：250 字、每分钟最多 1 条（均可通过 config.json 调）。
+      speak: {
+        maxChars: (() => {
+          const n = Number(speakRaw.maxChars);
+          return Number.isFinite(n) && n > 0 ? Math.min(1000, Math.round(n)) : 250;
+        })(),
+        minIntervalMs: (() => {
+          const n = Number(speakRaw.minIntervalMs);
+          return Number.isFinite(n) && n >= 0 ? Math.round(n) : 60000;
+        })()
+      }
     };
+  }
+
+  /** TTS 合成用的配置：config.tts + 管理员命令改过的 provider/voice/locale。 */
+  function ttsSettings() {
+    const ov = readVoiceState();
+    const raw = (cfg.tts && typeof cfg.tts === 'object') ? cfg.tts : {};
+    const provider = String(ov.provider || raw.provider || 'edge');
+    const providers = { ...(raw.providers && typeof raw.providers === 'object' ? raw.providers : {}) };
+    const cur = { ...(providers[provider] && typeof providers[provider] === 'object' ? providers[provider] : {}) };
+    if (ov.voice) cur.voice = String(ov.voice);
+    if (ov.locale) cur.locale = String(ov.locale);
+    providers[provider] = cur;
+    return { ...raw, provider, providers };
   }
 
   function voiceLibrary() {
@@ -1953,6 +2030,35 @@ async function main() {
     const wantVerify = verify === true || (verify !== false && vc.autoReadback);
     const verification = wantVerify ? await verifyVoiceMessageSent(sent.messageId) : null;
     return { ...sent, key, file: resolved.path, via: resolved.via, verification, readback: readbackText };
+  }
+
+  /**
+   * 让机器人「说一句话」：文本 → TTS 合成 → 当语音发到 key 这个会话。
+   *
+   * 闸门顺序是「先便宜后贵」：开关 → 文本长度/内容审计 → 频率 → 合成 → 发送。
+   * 合成一次要 2 秒左右、文本还会出站到 TTS 服务商，所以这些检查必须在合成之前做。
+   * 不在这里吞异常：调用方（管理员命令 / 将来的 AI 工具）负责把错误翻成一句人话。
+   */
+  async function speakVoiceForV2(key, text, { label = 'TTS', maxChars = null } = {}) {
+    const vc = voiceCfg();
+    if (!vc.enabled) throw new Error('语音发送当前是关的（管理员发 /语音 开 可打开）');
+    // 长度与空白校验（250 字上限），超长直接拒绝而不是悄悄截断。
+    const body = ttsPrepareText(text, { maxChars: maxChars ?? vc.speak.maxChars });
+    assertSpeakTextOk(key, body.text);
+    const sinceLast = Date.now() - (voiceSpeakAt.get(key) ?? 0);
+    if (sinceLast < vc.speak.minIntervalMs) {
+      const wait = Math.ceil((vc.speak.minIntervalMs - sinceLast) / 1000);
+      throw new Error(`说话太频繁：每分钟最多 1 条，还有 ${wait} 秒`);
+    }
+    const settings = ttsSettings();
+    const out = await ttsSynthesize(body.text, { config: settings, outDir: path.join(vc.dir, 'tts') });
+    // 合成成功就占住频率额度（即使后面发送失败，也不该立刻再来一次合成）。
+    voiceSpeakAt.set(key, Date.now());
+    const rel = path.relative(vc.dir, out.path).split(path.sep).join('/');
+    const sent = await sendVoiceForV2(key, rel, { label });
+    log(`[tts] ${key} 合成并发送语音 voice=${out.voice} ${body.chars} 字${out.duration ? ` / ${out.duration.toFixed(1)}s` : ''} messageId=${sent.messageId ?? '?'}`);
+    appendActivity(`${key} [tts] 语音 ${body.chars} 字（${out.voice}）messageId=${sent.messageId ?? '?'}`);
+    return { ...sent, tts: out, chars: body.chars, voice: out.voice, locale: out.locale };
   }
 
   // 发送一个收藏表情（按 emoji_id/url/md5 解析，发图片段）。
@@ -11203,6 +11309,117 @@ async function main() {
       if (plainContent === '/active' || plainContent === '/speak') {
         writeRoleState(roleState.role, 'active');
         await sendToQQ(key, '已退出静默模式，恢复正常回复。');
+        return;
+      }
+      // /语音 ... —— 语音发送（仅管理员）。四个子功能：
+      //   /语音              看当前状态（总闸/引擎/音色/语种/限流/语音库）
+      //   /语音 开|关        管理「发语音功能」总闸（写 state/voice-state.json，重启仍生效）
+      //   /语音 音色 <id>    换音色（默认 = 回到 config.json 的值）；/语音 音色列表 [语种]
+      //   /语音 语种 <语种>  换语种（zh-CN / 日语 / ja 都认），没给音色时用该语种的推荐音色
+      //   /语音 <文字>       直接把这段文字合成成语音发出来
+      // 闸门顺序与 speakVoiceForV2 一致：总闸 → 文本审计（要出站到 TTS 服务商）→ 250 字 → 1 条/分钟。
+      if (plainContent === '/语音' || plainContent === '/voice' || plainContent.startsWith('/语音 ') || plainContent.startsWith('/voice ')) {
+        const raw = plainContent.replace(/^\/(?:语音|voice)\s*/, '').trim();
+        const [sub = '', ...restParts] = raw ? raw.split(/\s+/) : [];
+        const arg = restParts.join(' ').trim();
+        const kw = sub.toLowerCase();
+        const vc = voiceCfg();
+        const settings = ttsSettings();
+        const curProv = String(settings.provider ?? 'edge');
+        const stored = readVoiceState();
+        const voiceNow = ttsResolveVoice({ config: settings, provider: curProv }).voice;
+        const locNow = ttsNormalizeLocale(stored.locale || cfg.tts?.locale || '') || '';
+        const locales = LOCALE_VOICES[curProv] ?? null;
+        const speakHint = vc.enabled ? '' : '（语音发送现在是关的，先发 /语音 开）';
+        if (!raw) {
+          const lib = voiceLibrary();
+          await sendToQQ(key, [
+            `语音发送：${vc.enabled ? '开' : '关'}`,
+            `引擎：${curProv}；音色：${voiceNow || '（引擎默认）'}${locNow ? `；语种：${locNow}` : ''}`,
+            `限制：单条 ≤ ${vc.speak.maxChars} 字；同一会话每 ${Math.round(vc.speak.minIntervalMs / 1000)} 秒最多 1 条`,
+            `语音库：${lib.length} 个文件${locales ? `；支持语种 ${Object.keys(locales).length} 个` : '（该引擎不按语种分类）'}`,
+            '',
+            '用法：/语音 开|关 · /语音 <要念的文字> · /语音 音色 <id>|默认 · /语音 音色列表 [语种] · /语音 语种 <语种>'
+          ].join('\n'));
+          return;
+        }
+        if (['开', 'on', '打开', '开启'].includes(kw)) {
+          writeVoiceState({ enabled: true });
+          await sendToQQ(key, '语音发送已开启（单条 ≤ ' + vc.speak.maxChars + ' 字，每 ' + Math.round(vc.speak.minIntervalMs / 1000) + ' 秒最多 1 条）。');
+          return;
+        }
+        if (['关', 'off', '关闭'].includes(kw)) {
+          writeVoiceState({ enabled: false });
+          await sendToQQ(key, '语音发送已关闭。');
+          return;
+        }
+        if (['音色', 'voice'].includes(kw)) {
+          if (!arg) {
+            await sendToQQ(key, `当前音色：${voiceNow || '（引擎默认）'}。改法：/语音 音色 zh-CN-XiaoxiaoNeural；/语音 音色 默认 恢复配置值；/语音 音色列表 [语种] 查看可选项。`);
+            return;
+          }
+          if (['默认', 'reset', 'default', '清空'].includes(arg.toLowerCase())) {
+            writeVoiceState({ voice: '' });
+            await sendToQQ(key, '音色已恢复为 config.json 里的值。');
+            return;
+          }
+          writeVoiceState({ voice: arg });
+          const next = ttsResolveVoice({ config: ttsSettings(), provider: curProv }).voice;
+          await sendToQQ(key, `音色已切换：${next}`);
+          return;
+        }
+        if (['音色列表', 'voices', 'list-voices'].includes(kw)) {
+          const wantLoc = arg ? ttsNormalizeLocale(arg) : locNow;
+          if (arg && !wantLoc) {
+            await sendToQQ(key, `认不出语种「${arg}」；可用：${locales ? Object.keys(locales).join(' ') : '（该引擎不按语种分类）'}`);
+            return;
+          }
+          try {
+            const res = await ttsListVoices({ config: settings, provider: curProv, locale: wantLoc || null, limit: 20 });
+            if (!res.ok) { await sendToQQ(key, `列音色失败：${res.error}`); return; }
+            const lines = (res.voices ?? []).map((v) => `· ${v.id}${v.gender ? `（${v.gender}）` : ''}${v.id === res.current ? ' ← 当前' : ''}`);
+            const scope = wantLoc ? `语种 ${wantLoc}` : '全部语种';
+            const more = res.total > lines.length ? `\n…共 ${res.total} 个，只显示前 ${lines.length} 个` : '';
+            await sendToQQ(key, [`${res.providerLabel} 的音色（${scope}）：`, ...lines, more].join('\n').trim());
+          } catch (error) {
+            await sendToQQ(key, `列音色失败：${String(error?.message ?? error).slice(0, 200)}`);
+          }
+          return;
+        }
+        if (['语种', 'locale', 'lang'].includes(kw)) {
+          if (!arg) {
+            if (!locales) { await sendToQQ(key, `「${curProv}」不按语种分类（多语种引擎），直接用 /语音 音色 <id> 选音色。`); return; }
+            const lines = Object.entries(locales).map(([id, v]) => `· ${id} ${v.label}（女 ${v.female} / 男 ${v.male}）${id === locNow ? ' ← 当前' : ''}`);
+            await sendToQQ(key, ['支持的语种：', ...lines].join('\n'));
+            return;
+          }
+          const loc = ttsNormalizeLocale(arg);
+          if (!loc) {
+            await sendToQQ(key, `认不出语种「${arg}」；可用：${locales ? Object.keys(locales).join(' ') : '该引擎不按语种分类'}（也认 中文/日语/粤语/en 这类简写）`);
+            return;
+          }
+          writeVoiceState({ locale: loc });
+          const picked = ttsResolveVoice({ config: ttsSettings(), provider: curProv, locale: loc });
+          await sendToQQ(key, `语种已设为 ${loc}；不指定音色时用 ${picked.voice || '引擎默认音色'}${picked.note ? `（${picked.note}）` : ''}。`);
+          return;
+        }
+        if (!vc.enabled) {
+          await sendToQQ(key, `语音发送现在是关的。先发 /语音 开 打开，再发 /语音 <要念的文字>。`);
+          return;
+        }
+        try {
+          const res = await speakVoiceForV2(key, raw, { label: '管理员' });
+          await sendToQQ(key, `已发送语音（${res.chars} 字 · ${res.voice ?? '默认音色'}${res.tts?.duration ? ` · ${res.tts.duration.toFixed(1)}s` : ''}）`);
+        } catch (error) {
+          const msg = String(error?.message ?? error);
+          log(`[tts] 管理员语音发送失败 (${key}): ${msg.slice(0, 300)}`);
+          // 原始错误只写日志：里面可能带路径或服务商返回的原文。
+          const friendly = /太频繁/.test(msg) ? msg
+            : /超过|太长|maxChars|上限/.test(msg) ? `这段文字超过单条上限（${vc.speak.maxChars} 字），请缩短。`
+              : /疑似包含|敏感|令牌/.test(msg) ? '这段文字疑似包含敏感信息，语音合成会把原文发给 TTS 服务商，已阻止。'
+                : '语音发送失败，详情已写入日志。';
+          await sendToQQ(key, friendly);
+        }
         return;
       }
       // /recall [序号] —— 撤回机器人自己发过的消息（仅管理员，桥接直接执行）。

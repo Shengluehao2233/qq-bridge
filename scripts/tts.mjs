@@ -11,7 +11,8 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
-  synthesize, listProviders, listVoices, normalizeConfig, pruneOutputs, TtsError
+  synthesize, listProviders, listVoices, normalizeConfig, pruneOutputs,
+  LOCALE_VOICES, normalizeLocale, resolveVoice, TtsError
 } from '../src/tts/index.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -52,6 +53,18 @@ const fail = (msg, code = 1) => {
   else console.error(`❌ ${msg}`);
   process.exit(code);
 };
+
+/**
+ * 语种参数：--lang 或 --locale，接受 zh-CN / en / 日语 这类写法。
+ * 认不出来的写法直接报错（而不是悄悄当默认语种），否则用户会以为改成功了。
+ */
+function langArg() {
+  const raw = val('locale', val('lang', null));
+  if (raw === null || raw === undefined || raw === '') return null;
+  const loc = normalizeLocale(raw);
+  if (!loc) fail(`认不出语种「${raw}」；可用：${Object.keys(LOCALE_VOICES.edge).join(' / ')}（或 zh / en / ja 这类简写）`);
+  return loc;
+}
 
 function loadConfig() {
   const p = path.resolve(val('config', CONFIG_PATH));
@@ -109,19 +122,47 @@ function cmdProviders() {
 
 async function cmdVoices() {
   try {
-    const res = await listVoices({ config: ttsRaw, provider, timeoutMs: num('timeout', undefined) });
+    const loc = langArg();
+    const res = await listVoices({
+      config: ttsRaw,
+      provider,
+      locale: loc,
+      limit: num('limit', undefined),
+      timeoutMs: num('timeout', undefined)
+    });
     if (asJson) { console.log(JSON.stringify(res, null, 2)); return; }
     if (!res.ok) fail(res.error);
     const voices = Array.isArray(res.voices) ? res.voices : [];
-    out(`${res.providerLabel ?? provider} 的可用音色（${voices.length} 个）：`);
+    const scope = loc ? `语种 ${loc}` : '全部语种';
+    const paging = res.total > voices.length ? `，只显示前 ${voices.length} 个` : '';
+    out(`${res.providerLabel ?? provider} 的音色（${scope}，共 ${res.total} 个${paging}）：`);
+    if (res.recommended) out(`  推荐：女声 ${res.recommended.female} / 男声 ${res.recommended.male}`);
     for (const v of voices) {
       const cur = v.id === res.current ? ' ← 当前' : '';
       const meta = [v.gender, v.categories, v.tags].filter(Boolean).join(' · ');
       out(`  ${v.id.padEnd(34)} ${meta}${cur}`);
     }
+    if (!loc) out(`\n可用语种：${Object.keys(LOCALE_VOICES[res.provider] ?? {}).join(' ') || '（该引擎不按语种分类）'}`);
   } catch (error) {
     fail(error?.message ?? error);
   }
+}
+
+/** 列语种：给的是「推荐音色」表，不联网。 */
+function cmdLangs() {
+  const rows = LOCALE_VOICES[provider];
+  if (asJson) { console.log(JSON.stringify({ ok: true, provider, locales: rows ?? {} }, null, 2)); return; }
+  if (!rows) {
+    out(`「${provider}」不按语种分类（它是多语种引擎，直接用 --voice 选音色）。`);
+    return;
+  }
+  const resolved = resolveVoice({ config: ttsRaw, provider, locale: langArg() });
+  out(`${provider} 支持的语种（推荐音色）：`);
+  for (const [id, v] of Object.entries(rows)) {
+    const cur = id === resolved.locale ? ' ← 当前' : '';
+    out(`  ${id.padEnd(7)} ${String(v.label).padEnd(14)} 女声 ${v.female.padEnd(26)} 男声 ${v.male}${cur}`);
+  }
+  out(`\n当前语种：${resolved.locale || '未设置'}；不指定音色时用该语种的推荐音色（默认女声，加 --gender male 换男声）。`);
 }
 
 function textFromArgs() {
@@ -143,12 +184,15 @@ async function cmdSynth() {
 
   const outDir = val('out-dir', undefined);
   const filename = val('out', undefined) ? String(val('out')) : null;
+  const loc = langArg();
   let result;
   try {
     result = await synthesize(text, {
       config: ttsRaw,
       provider,
       voice: val('voice', null),
+      locale: loc,
+      gender: val('gender', null),
       outDir: outDir ? path.resolve(String(outDir)) : null,
       filename,
       maxChars: num('max-chars', undefined),
@@ -171,9 +215,10 @@ async function cmdSynth() {
   } else {
     out('─'.repeat(60));
     out(`文本  : ${maskText(result.text)}（${result.chars} 字）`);
-    out(`引擎  : ${result.providerLabel}${result.voice ? ` · 音色 ${result.voice}` : ''}`);
+    out(`引擎  : ${result.providerLabel}${result.voice ? ` · 音色 ${result.voice}` : ''}${result.locale ? ` · 语种 ${result.locale}` : ''}`);
     out(`音频  : ${result.path}`);
     out(`        ${result.duration ? `${result.duration.toFixed(1)}s · ` : ''}${(result.bytes / 1024).toFixed(1)} KB · 合成 ${result.ms} ms`);
+    if (result.warning) out(`ℹ️  ${result.warning}`);
     for (const w of result.warnings ?? []) out(`⚠️  ${w}`);
     out('─'.repeat(60));
   }
@@ -208,11 +253,19 @@ function usage(code = 0) {
     '',
     '  查看：',
     '    node scripts/tts.mjs --list-providers',
-    '    node scripts/tts.mjs --list-voices [--provider edge]',
+    '    node scripts/tts.mjs --list-langs                        # 语种与推荐音色',
+    '    node scripts/tts.mjs --list-voices [--provider edge]     # 全部音色',
+    '    node scripts/tts.mjs --list-voices --lang ja --limit 20  # 只看日语',
+    '',
+    '  语种与音色：',
+    '    --lang <语种>      zh-CN / zh-TW / zh-HK / en-US / en-GB / ja-JP / ko-KR / fr-FR …',
+    '                       （也认 zh、en、ja、日语、粤语、英语 这类简写）',
+    '                       只给语种时，自动用该语种的推荐音色（默认女声）',
+    '    --gender male|female   语种推荐音色里挑男声还是女声（默认 female）',
+    '    --voice <name>     指定音色 id（优先级最高，如 zh-CN-XiaoyiNeural）',
     '',
     '  常用参数：',
     '    --provider <id>   edge / openai / azure / siliconflow（默认取 config.tts.provider）',
-    '    --voice <name>    音色；edge 用 zh-CN-XiaoyiNeural 这类，云服务用各自的音色名',
     '    --rate/--pitch/--volume   语速/音调/音量（edge 形如 +10% / +0Hz；azure 同）',
     '    --out <文件>      指定输出文件名（默认 tts-时间戳.mp3，落在 audio/tts/）',
     '    --out-dir <目录>  指定输出目录',
@@ -233,6 +286,7 @@ function usage(code = 0) {
 if (has('help') || has('h')) usage(0);
 if (has('list-providers')) cmdProviders();
 else if (has('list-voices')) await cmdVoices();
+else if (has('list-langs') || has('list-locales')) cmdLangs();
 else if (has('prune')) {
   const dir = path.resolve(val('out-dir', ttsCfg.outputDir));
   const n = pruneOutputs(dir, { keep: num('keep', 0) });
