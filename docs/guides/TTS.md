@@ -110,9 +110,21 @@ node scripts/tts.mjs "试一下" --send group:542654144 --dry-run   # 只校验�
 
 # 查看
 node scripts/tts.mjs --list-providers     # 四家服务商 + 配没配好
+node scripts/tts.mjs --list-langs         # 语种表 + 每个语种的推荐音色（不联网）
 node scripts/tts.mjs --list-voices        # 音色清单（中文排在前面）
+node scripts/tts.mjs --list-voices --lang ja --limit 20   # 只看日语的前 20 个
 node scripts/tts.mjs --prune --keep 20    # 清理旧产物
+
+# 语种 / 性别（等价于挑该语种的推荐音色）
+node scripts/tts.mjs "おはよう" --lang ja                 # → ja-JP-NanamiNeural（女）
+node scripts/tts.mjs "Good morning" --lang en --gender male  # → en-US-GuyNeural（男）
+node scripts/tts.mjs "你好" --voice zh-CN-XiaoxiaoNeural  # 显式音色，优先级最高
 ```
+
+**音色解析优先级**：`--voice` 显式指定 > 语种推荐音色（`--gender` 选男女）> `config.tts.providers.<id>.voice` > provider 默认。
+语种支持 `zh-CN / zh-TW / zh-HK / en-US / en-GB / ja-JP / ko-KR / fr-FR / de-DE / es-ES / ru-RU / it-IT / pt-BR`
+以及口语写法（`zh`、`en`、`ja`、`日语`、`粤语`、`英文`…）。多语种引擎（OpenAI / CosyVoice2）不吃语种参数，
+会明确提示「该引擎不按语种选音色」，而不是悄悄忽略。
 
 输出示例：
 
@@ -125,6 +137,27 @@ node scripts/tts.mjs --prune --keep 20    # 清理旧产物
 
 `--json` 会输出结构化结果（`path / bytes / duration / provider / voice / text / chars / ms`），方便其它脚本消费。
 
+### 管理员命令（QQ 群里，只有 ownerQQ 能用）
+
+| 命令 | 作用 |
+| --- | --- |
+| `/语音` / `/voice` | 看状态：总闸、引擎、音色、语种、限流、语音库文件数 |
+| `/语音 开` / `/语音 关` | 开 / 关「发语音功能」总闸 |
+| `/语音 <文字>` | 把这段文字合成成语音，发到当前会话 |
+| `/语音 音色 <id>` | 换音色；`/语音 音色 默认` 回到 config.json 里的值 |
+| `/语音 音色列表 [语种]` | 列音色（联网向服务商查询，默认列前 20 个） |
+| `/语音 语种 <语种>` | 换语种；不带参数则列出语种表与该语种的推荐音色 |
+
+闸门顺序与内部实现一致，**先便宜后贵**：
+
+1. 总闸：`socialV2.voice.enabled` 或管理员 `/语音 开`；
+2. 文本审计：要念的原文**会出站到 TTS 服务商**，含路径 / 凭据 / 会话令牌直接拒绝；
+3. 长度：单条 ≤ `socialV2.voice.speak.maxChars`（默认 **250 字**），超了拒绝而不是截断；
+4. 频率：同一会话每 `speak.minIntervalMs`（默认 **60000 ms**）最多 1 条，合成成功即占额度。
+
+管理员改过的开关 / 音色 / 语种写在 `state/voice-state.json`，重启桥接仍然生效；
+`config.json` 永远是「出厂值」，改它才是改默认。
+
 ---
 
 ## 5. 和语音发送链路的关系
@@ -132,6 +165,7 @@ node scripts/tts.mjs --prune --keep 20    # 清理旧产物
 ```
 文字 ──(src/tts)──> audio/tts/xxx.mp3 ──┬─> send-voice.mjs（操作者通道，可发库外文件）
                                         ├─> 桥接 /api/voice/send（控制台面板）
+                                        ├─> /语音 <文字>（管理员命令，在 QQ 里直接触发）
                                         └─> qq_send_voice（AI 通道，只允许库内路径）
 ```
 
