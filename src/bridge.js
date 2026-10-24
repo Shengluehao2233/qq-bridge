@@ -1689,7 +1689,8 @@ async function main() {
     if (ov.voice) cur.voice = String(ov.voice);
     if (ov.locale) cur.locale = String(ov.locale);
     providers[provider] = cur;
-    return { ...raw, provider, providers };
+    // 顶层 locale 同步一份：normalizeConfig / CLI 展示读的是顶层，per-provider 只影响该引擎。
+    return { ...raw, provider, locale: String(ov.locale || raw.locale || ''), providers };
   }
 
   function voiceLibrary() {
@@ -11386,7 +11387,7 @@ async function main() {
           }
           return;
         }
-        if (['语种', 'locale', 'lang'].includes(kw)) {
+        if (['语种', '语言', '語言', 'locale', 'lang', 'language'].includes(kw)) {
           if (!arg) {
             if (!locales) { await sendToQQ(key, `「${curProv}」不按语种分类（多语种引擎），直接用 /语音 音色 <id> 选音色。`); return; }
             const lines = Object.entries(locales).map(([id, v]) => `· ${id} ${v.label}（女 ${v.female} / 男 ${v.male}）${id === locNow ? ' ← 当前' : ''}`);

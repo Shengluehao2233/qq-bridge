@@ -10,7 +10,8 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   normalizeConfig, prepareText, resolveProvider, synthesize, listProviders,
-  pruneOutputs, writeFileAtomic, PROVIDERS, DEFAULT_TTS, TtsError
+  pruneOutputs, writeFileAtomic, PROVIDERS, DEFAULT_TTS, TtsError,
+  resolveVoice, normalizeLocale, localeFromVoiceId
 } from '../src/tts/index.js';
 
 const LIVE = process.argv.includes('--live');
@@ -146,7 +147,59 @@ await t('超长文本在调用引擎前就被挡住（不会白花一次合成�
   );
 });
 
-// ── 4. 落盘与清理 ───────────────────────────────────────────────────────────
+// ── 4. 语种与音色解析 ───────────────────────────────────────────────────────
+section('语种与音色 resolveVoice');
+
+await t('显式 voice 优先级最高', () => {
+  const r = resolveVoice({ config: { provider: 'edge', providers: { edge: { locale: 'ja-JP' } } }, voice: 'zh-CN-XiaoxiaoNeural' });
+  assert.equal(r.voice, 'zh-CN-XiaoxiaoNeural');
+  assert.equal(r.source, 'explicit');
+});
+
+await t('providers.<id>.locale 决定推荐音色', () => {
+  const r = resolveVoice({ config: { provider: 'edge', providers: { edge: { locale: 'ja-JP' } } } });
+  assert.equal(r.voice, 'ja-JP-NanamiNeural');
+  assert.equal(r.locale, 'ja-JP');
+  assert.equal(r.source, 'locale');
+});
+
+// 回归：2026-10-24 真实故障 —— /语音 语种 写进 providers.<id>.locale，
+// 但调用方传了空字符串 locale（`locale ?? cfg.locale` 在 cfg.locale 为空时是 ''），
+// 空串把 settings.locale 盖掉，于是「语种改了但声音没变」。空串必须当成「没指定」。
+await t('空字符串 locale 不会掩盖 providers.locale（回归）', () => {
+  const r = resolveVoice({ config: { provider: 'edge', providers: { edge: { locale: 'en-US' } } }, locale: '' });
+  assert.equal(r.voice, 'en-US-AriaNeural');
+});
+
+await t('顶层 locale 生效', () => {
+  const r = resolveVoice({ config: { provider: 'edge', locale: 'ko-KR', providers: { edge: {} } } });
+  assert.equal(r.voice, 'ko-KR-SunHiNeural');
+});
+
+await t('gender 选男声', () => {
+  const r = resolveVoice({ config: { provider: 'edge', providers: { edge: { locale: 'en-US' } } }, gender: 'male' });
+  assert.equal(r.voice, 'en-US-GuyNeural');
+});
+
+await t('口语写法能归一化（日语 / yue / zh-tw）', () => {
+  assert.equal(normalizeLocale('日语'), 'ja-JP');
+  assert.equal(normalizeLocale('yue'), 'zh-HK');
+  assert.equal(normalizeLocale('zh-tw'), 'zh-TW');
+  assert.equal(normalizeLocale('瞎写的'), null);
+});
+
+await t('从音色 id 反推语种', () => {
+  assert.equal(localeFromVoiceId('zh-TW-HsiaoChenNeural'), 'zh-TW');
+  assert.equal(localeFromVoiceId('not-a-voice'), null);
+});
+
+await t('多语种引擎不吃语种参数时会给出说明，而不是静默忽略', () => {
+  const r = resolveVoice({ config: { provider: 'openai', providers: { openai: {} } }, locale: 'ja-JP' });
+  assert.equal(r.voice, 'alloy');
+  assert.match(r.note, /不按语种选音色/);
+});
+
+// ── 5. 落盘与清理 ───────────────────────────────────────────────────────────
 section('落盘与清理');
 
 await t('writeFileAtomic 写入成功且不留 .tmp', () => {
