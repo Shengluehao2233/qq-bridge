@@ -139,7 +139,10 @@ export function localeVoices(providerId, locale = null) {
  */
 export function resolveVoice({ config = null, provider = null, voice = null, locale = null, gender = null } = {}) {
   const { mod, settings, cfg } = resolveProvider(config, provider);
-  const loc = normalizeLocale(locale ?? settings.locale);
+  // 注意用 || 而不是 ??：调用方经常传空字符串（`locale ?? cfg.locale` 在 cfg.locale 为空时就是 ''），
+  // 而空字符串必须当成「没指定」，否则会盖掉 settings.locale（= config.tts.providers.<id>.locale，
+  // 管理员 /语音 语种 改的就是这里），表现为「语种改了但声音没变」。2026-10-24 真踩过。
+  const loc = normalizeLocale(locale) || normalizeLocale(settings.locale) || normalizeLocale(cfg.locale);
   const table = LOCALE_VOICES[mod.meta.id] ?? {};
   const picked = loc && table[loc] ? table[loc] : null;
   const wantGender = String(gender || '').toLowerCase();
@@ -275,7 +278,7 @@ export async function synthesize(input, {
   const body = prepareText(input, { maxChars: maxChars ?? cfg.maxChars });
   // 音色的解析优先级统一在 resolveVoice 里（显式 > 语种推荐 > 配置 > provider 默认），
   // 免得 CLI / 桥接 / 将来的 qq_speak 三处各写一份。
-  const picked = resolveVoice({ config, provider: mod.meta.id, voice, locale: locale ?? cfg.locale, gender });
+  const picked = resolveVoice({ config, provider: mod.meta.id, voice, locale: locale || cfg.locale || null, gender });
   const finalVoice = picked.voice;
   const started = Date.now();
 
