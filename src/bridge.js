@@ -31,6 +31,8 @@ import { resolvePriceTable } from './model-prices.js';
 // TTS（文字转语音）：合成逻辑全在 src/tts/，桥接只负责「谁在什么时候让谁说」。
 import { synthesize as ttsSynthesize, prepareText as ttsPrepareText, normalizeLocale as ttsNormalizeLocale, resolveVoice as ttsResolveVoice, listVoices as ttsListVoices, LOCALE_VOICES, TtsError } from './tts/index.js';
 import { createTokenLedger } from './token-ledger.js';
+// 视频理解：抽帧拼联系表 + 音轨转写，全部在 src/video-digest.js（复用 video-watch skill）。
+import { digestVideo, probeVideo, makeVideoWorkDir, cleanupVideoWorkDir, VIDEO_DEFAULTS } from './video-digest.js';
 import {
   loadSlang,
   saveSlang,
@@ -244,6 +246,25 @@ function sweepStaleTempFiles(dir) {
     for (const name of fs.readdirSync(dir)) {
       if (!name.endsWith('.tmp')) continue;
       try { fs.unlinkSync(path.join(dir, name)); } catch {}
+    }
+  } catch {}
+}
+
+// 视频抽帧目录（state/tmp-video/video-<pid>-<ts>）：只有在处理某条视频时存在。
+// 进程被强杀 / 重启时 watch.py 的产物会留下，所以启动时清掉「两小时没动过」的那些。
+// 为什么要看年龄：正常路径是 finally 里删掉，只有异常退出才会残留。
+function sweepStaleVideoDirs(dir) {
+  const MAX_AGE_MS = 2 * 60 * 60 * 1000;
+  try {
+    const now = Date.now();
+    for (const name of fs.readdirSync(dir)) {
+      const full = path.join(dir, name);
+      try {
+        const stat = fs.statSync(full);
+        if (!stat.isDirectory()) { fs.rmSync(full, { force: true }); continue; }
+        if (now - stat.mtimeMs < MAX_AGE_MS) continue;
+        fs.rmSync(full, { recursive: true, force: true });
+      } catch {}
     }
   } catch {}
 }
@@ -1422,6 +1443,17 @@ function extractMediaFromSegments(segments) {
         url: String(d.url ?? ''),
         summary: sanitizeMediaSummary(d.summary)
       });
+    } else if (seg.type === 'video') {
+      // QQ 视频：模型不能播放视频，但能读「关键帧联系表 + 音轨转写」（见 video-digest.js）。
+      // 这里必须保持同步、零 IO（本函数在消息入库路径上被高频调用），真正的下载/抽帧
+      // 放到 resolveMediaList 里按需做。
+      media.push({
+        kind: 'video',
+        file: String(d.file ?? ''),
+        url: String(d.url ?? ''),
+        name: String(d.name ?? d.file_name ?? ''),
+        summary: sanitizeMediaSummary(d.summary)
+      });
     }
   }
   return media;
@@ -1461,6 +1493,9 @@ async function main() {
   hardenStateDirAcl();
   // 清掉历史 rename 失败残留的 .tmp（不触碰正常状态文件）。
   sweepStaleTempFiles(STATE_DIR);
+  // 视频抽帧的临时目录：进程被强杀时 watch.py 的工作目录会留下来（含几百 KB 帧图），
+  // 只在启动时清一次「超过 2 小时没动过」的，正在处理的那条不会被动。
+  sweepStaleVideoDirs(path.join(STATE_DIR, 'tmp-video'));
   acquireLock();
   loadState();
 
@@ -5987,6 +6022,30 @@ async function main() {
           return;
         }
 
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/watch-video') {
+          const body = await readBody();
+          const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          const link = String(body.url ?? body.link ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空（格式 group:群号 或 private:QQ号）' }, 400); return; }
+          if (!link) { sendJson({ ok: false, error: 'url 不能为空' }, 400); return; }
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!token) { sendJson({ ok: false, error: 'reserved2 模式必须携带 agent token' }, 403); return; }
+          if (!agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2ToolEnabled('watchVideo')) { sendJson({ ok: false, error: '工具未启用：qq_watch_video' }, 403); return; }
+          if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          const result = await digestVideoUrl(link);
+          if (!result.ok) { sendJson({ ok: false, error: result.reason }, 400); return; }
+          sendJson({
+            ok: true,
+            key,
+            describe: result.describe,
+            transcript: result.transcriptText,
+            images: result.images.map((s) => ({ mimeType: 'image/jpeg', data: s.buffer.toString('base64'), name: s.name }))
+          });
+          return;
+        }
+
         if (req.method === 'POST' && url.pathname === '/api/socialV2/send-sticker') {
           if (!stickerEnabled()) { sendJson({ ok: false, error: '表情包体系已关闭' }, 403); return; }
           const body = await readBody();
@@ -7870,6 +7929,37 @@ async function main() {
   })(); // 单张图片像素上限，防止“图片炸弹”解码拖垮 DSH
   const MAX_MEDIA_STORE_PER_KEY = 500; // 每个会话最多缓存多少条消息的媒体元数据，防止无限增长
 
+  // ── 视频理解 ───────────────────────────────────────────────────────────────
+  //
+  // 模型不能播放视频，但能读图片和文字。一条群里发的视频会被处理成：
+  //   ① 3×3 关键帧联系表（图片，每格标 `#frame mm:ss`）—— 交给模型「看」；
+  //   ② 音轨转写文本（faster-whisper 本地跑）—— 交给模型「读」；
+  //   ③ 一行元信息（时长/分辨率/有没有声音）—— 帮模型判断值不值得说。
+  // 具体实现在 src/video-digest.js（复用 video-watch skill 的 watch.py）。
+  //
+  // 默认关掉很长的视频：抽帧走 ffmpeg、转写要加载 Whisper 模型，30 分钟的直播回放
+  // 会把整轮对话卡住好几分钟，群友只会觉得「bot 死了」。上限见 VIDEO_DEFAULTS。
+  const VIDEO_CFG = (() => {
+    const raw = cfg.socialV2?.media?.video ?? {};
+    const merged = { ...VIDEO_DEFAULTS, ...raw };
+    const num = (v, d, min, max) => {
+      const n = Number(v);
+      return Number.isFinite(n) && n > 0 ? Math.min(max, Math.max(min, Math.round(n))) : d;
+    };
+    return {
+      ...merged,
+      maxBytes: num(merged.maxBytes, VIDEO_DEFAULTS.maxBytes, 256 * 1024, 128 * 1024 * 1024),
+      maxSeconds: num(merged.maxSeconds, VIDEO_DEFAULTS.maxSeconds, 5, 3600),
+      maxFrames: num(merged.maxFrames, VIDEO_DEFAULTS.maxFrames, 1, 64),
+      maxSheets: num(merged.maxSheets, VIDEO_DEFAULTS.maxSheets, 1, 6),
+      timeoutMs: num(merged.timeoutMs, VIDEO_DEFAULTS.timeoutMs, 10_000, 1_800_000),
+      maxTranscriptChars: num(merged.maxTranscriptChars, VIDEO_DEFAULTS.maxTranscriptChars, 200, 20_000),
+      enabled: merged.enabled !== false
+    };
+  })();
+  // 抽帧/转写的临时目录：放在 state/ 下便于清理，且与音频临时文件同级。
+  const VIDEO_TMP_DIR = path.join(STATE_DIR, 'tmp-video');
+
   // ── 喂给模型的那一份：体积与动图形态归一化 ────────────────────────────────
   //
   // 为什么必须在这里动手（而不是"让 DSH 自己处理"）：
@@ -8075,6 +8165,66 @@ async function main() {
     return { text: fallbackText };
   }
 
+  // 把 digestVideo 的结果整理成「一行描述 + 一段转写」——两种来源（群里视频、链接）共用。
+  function formatVideoDigest(digest, index) {
+    const transcriptAll = String(digest.transcript ?? '');
+    const transcript = transcriptAll.slice(0, VIDEO_CFG.maxTranscriptChars);
+    const transcriptText = transcript
+      ? `[视频${index}的说话内容（机器转写，可能有错字）] ${transcript}${transcriptAll.length > VIDEO_CFG.maxTranscriptChars ? '…（已截断）' : ''}`
+      : '';
+    const bits = [];
+    const d = digest.probe ?? {};
+    if (d.durationSec) bits.push(`时长 ${d.durationSec}s`);
+    if (d.width && d.height) bits.push(`${d.width}×${d.height}`);
+    if (d.hasAudio !== undefined) bits.push(d.hasAudio === false ? '没有音轨' : '有声音');
+    bits.push(`${digest.sheets.length} 张关键帧联系表（每张 3×3，格子按左上→右下排，每格左上角标 #frame 分:秒）`);
+    if (!transcript) bits.push('没识别到说话内容');
+    if (digest.warning) bits.push(digest.warning);
+    return { describe: bits.join('，'), transcriptText, images: digest.sheets };
+  }
+
+  // 一条 QQ 视频 → 联系表图片 + 转写文本。永不抛错：失败也要给一句话，交给模型去解释。
+  async function digestQqVideo(media, index) {
+    if (!VIDEO_CFG.enabled) return { ok: false, reason: '视频理解已关闭（config.json 的 socialV2.media.video.enabled）' };
+    const url = String(media?.url ?? '');
+    if (!url) return { ok: false, reason: 'OneBot 只给了 file 没给直链，下载不到' };
+    const work = makeVideoWorkDir(VIDEO_TMP_DIR);
+    try {
+      const buf = await safeFetchBuffer(url, VIDEO_CFG.maxBytes);
+      if (!buf?.length) return { ok: false, reason: '视频下载为空（链接可能已过期）' };
+      if (buf.length > VIDEO_CFG.maxBytes) {
+        return { ok: false, reason: `视频 ${formatBytes(buf.length)} 超过单条上限 ${formatBytes(VIDEO_CFG.maxBytes)}` };
+      }
+      const src = path.join(work, 'input.mp4');
+      fs.writeFileSync(src, buf);
+      const probe = await probeVideo(src);
+      if (probe?.durationSec && probe.durationSec > VIDEO_CFG.maxSeconds) {
+        return { ok: false, reason: `视频 ${probe.durationSec}s 超过上限 ${VIDEO_CFG.maxSeconds}s（太长的视频会把整轮对话卡住）` };
+      }
+      const digest = await digestVideo({ filePath: src, outDir: path.join(work, 'out'), cfg: VIDEO_CFG, onLog: (m) => log(m) });
+      if (!digest.ok) return { ok: false, reason: digest.reason || '视频处理失败' };
+      return { ok: true, ...formatVideoDigest({ ...digest, probe: digest.probe ?? probe }, index) };
+    } finally {
+      cleanupVideoWorkDir(work);
+    }
+  }
+
+  // 链接看视频（AI 工具 qq_watch_video 走这里）：下载交给 watch.py 的 yt-dlp，
+  // 所以 B 站/抖音/YouTube 都能看；本地没有文件可探测，元信息由 watch.py 回填。
+  async function digestVideoUrl(url) {
+    if (!VIDEO_CFG.enabled) return { ok: false, reason: '视频理解已关闭（config.json 的 socialV2.media.video.enabled）' };
+    const link = String(url ?? '').trim();
+    if (!/^https?:\/\//i.test(link)) return { ok: false, reason: '不是 http(s) 链接' };
+    const work = makeVideoWorkDir(VIDEO_TMP_DIR);
+    try {
+      const digest = await digestVideo({ sourceUrl: link, outDir: path.join(work, 'out'), cfg: VIDEO_CFG, onLog: (m) => log(m) });
+      if (!digest.ok) return { ok: false, reason: digest.reason || '视频处理失败' };
+      return { ok: true, ...formatVideoDigest(digest, 1) };
+    } finally {
+      cleanupVideoWorkDir(work);
+    }
+  }
+
   async function resolveMediaList(mediaList) {
     const parts = [];
     let index = 0;
@@ -8103,6 +8253,24 @@ async function main() {
           parts.push({ type: 'text', text: `[表情${index}（${prep.error}）]` });
         } else {
           parts.push({ type: 'text', text: face.text || `[表情#${media.faceId}]` });
+        }
+      } else if (media.kind === 'video') {
+        const label = `[视频${index}]`;
+        const digest = await digestQqVideo(media, index);
+        if (!digest.ok) {
+          parts.push({ type: 'text', text: `${label}（${digest.reason}）` });
+          continue;
+        }
+        parts.push({ type: 'text', text: `${label} ${digest.describe}` });
+        if (digest.transcriptText) parts.push({ type: 'text', text: digest.transcriptText });
+        for (let s = 0; s < digest.images.length; s += 1) {
+          const sheet = digest.images[s];
+          if (totalBytes + sheet.buffer.length > MAX_MEDIA_BYTES) {
+            parts.push({ type: 'text', text: `（${label} 联系表总大小超限，已跳过后面 ${digest.images.length - s} 张）` });
+            break;
+          }
+          totalBytes += sheet.buffer.length;
+          parts.push({ type: 'image', mediaType: 'image/jpeg', data: sheet.buffer.toString('base64'), name: `video-${index}-${sheet.name}` });
         }
       } else {
         const img = await fetchOneBotImage(media);

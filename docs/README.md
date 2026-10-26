@@ -14,7 +14,9 @@
 | [guides/PROJECT_GUIDE.md](guides/PROJECT_GUIDE.md) | **权威项目说明书**（113 KB / 1450+ 行）：架构、内外核划分、数据流、配置全解、安全机制、调试与改进指南，含 2026-08-20 ~ 2026-09-11 的逐轮更新记录 | ✅ **唯一权威版本**（另一份同名精简版已归档到 legacy，见下） |
 | [guides/DSH_SETUP.md](guides/DSH_SETUP.md) | DSH 端安装说明：`qq-chat` / `qq-chat-v2` preset 与三个 MCP server 怎么挂到目标设备的 DSH 上 | ✅ |
 | [guides/VOICE.md](guides/VOICE.md) | 语音发送全解：独立工具（`voice-tool/` 的图形界面与命令行）、桥接 CLI、AI 工具、控制台面板，以及**工具拆出后的配置解析顺序** | ✅ 2026 整理时已更新（工具移到上一级 `voice-tool/`） |
-| [guides/TTS.md](guides/TTS.md) | **TTS 语音合成**：文字 → mp3（默认 edge-tts 免费，OpenAI / Azure / 硅基流动已接好，填 Key 即切换）、provider 契约与新增流程、`config.tts` 全字段、`scripts/tts.mjs` 用法、与语音发送链路的关系、安全与排错 | ✅ 2026-10-24 新增 |\n| [guides/TOKEN_USAGE_CONSOLE.md](guides/TOKEN_USAGE_CONSOLE.md) | 控制台「令牌与花费」看板：数据来源、计价口径（峰谷分时）、API、配置 | ✅ |
+| [guides/TTS.md](guides/TTS.md) | **TTS 语音合成**：文字 → mp3（默认 edge-tts 免费，OpenAI / Azure / 硅基流动已接好，填 Key 即切换）、provider 契约与新增流程、`config.tts` 全字段、`scripts/tts.mjs` 用法、与语音发送链路的关系、安全与排错 | ✅ 2026-10-24 新增 |
+| [guides/VIDEO.md](guides/VIDEO.md) | **视频理解**：群里发的视频怎么变成「联系表截图 + Whisper 转写」喂给模型、`config.socialV2.media.video` 全字段、uv/ffmpeg/skill 依赖、链接看视频的 `watch.py` 用法、排错表 | ✅ 2026-10-26 新增 |
+| [guides/TOKEN_USAGE_CONSOLE.md](guides/TOKEN_USAGE_CONSOLE.md) | 控制台「令牌与花费」看板：数据来源、计价口径（峰谷分时）、API、配置 | ✅ |
 | [guides/CONSOLE-UI-TESTING.md](guides/CONSOLE-UI-TESTING.md) | 控制台离线预览（`npm run preview:console`）与离线浏览器回归（`npm run test:console-ui`）怎么用 | ✅ 2026 整理时自 `scripts/` 移入 |
 | [guides/SECURITY_BASELINE.md](guides/SECURITY_BASELINE.md) | **安全基线与威胁模型**：威胁主体、已实现的边界（准入/工具面/出站/控制台/落盘/网络）、已知残余风险、发布前回归清单、改动检查单 | ✅ **改动安全相关代码前必读**（2026-09-20 新增） |
 

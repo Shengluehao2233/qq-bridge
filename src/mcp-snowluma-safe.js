@@ -1249,6 +1249,39 @@ if (cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.sendVoice !==
   );
 }
 
+if (cfg.socialV2?.media?.video?.enabled !== false && cfg.socialV2?.tools?.watchVideo !== false) {
+  server.tool(
+    'qq_watch_video',
+    '看一个视频链接（B 站/抖音/YouTube/X 等 yt-dlp 支持的站点，或直链 mp4）。返回：①几张关键帧联系表图片（每张 3×3，每格左上角标 #frame 分:秒，按左上→右下顺序就是时间顺序）→ 你会真的「看到」画面；②带时间戳的音轨转写 → 你「听到」说了什么；③一行元信息（时长/分辨率/有没有声音）。什么时候用：群友发视频链接问你「这里面讲了啥/好笑吗/说了什么」，或者你想确认某个视频内容时。注意：① 只接受 http(s) 链接，本地文件不行；② 三分钟以上的视频会被拒绝（太慢），长视频请让群友给片段；③ 第一次处理某个视频要下载依赖/模型，可能等 1-3 分钟，之后几秒；④ 返回失败原因（比如链接失效、需要登录、超时）时如实说看不了，别编内容。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      url: z.string().describe('视频链接（必须 http/https）')
+    },
+    async ({ key, token, url }) => {
+      try {
+        const data = await agentApi('/api/socialV2/watch-video', {
+          method: 'POST',
+          body: JSON.stringify({ key, url: String(url), token }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 600000
+        });
+        if (!data?.ok) {
+          return { content: [{ type: 'text', text: `看不了这个视频：${errorText(data?.error, '未知原因')}` }], isError: true };
+        }
+        const content = [{ type: 'text', text: `视频信息：${String(data.describe ?? '')}` }];
+        if (data.transcript) content.push({ type: 'text', text: String(data.transcript) });
+        for (const image of Array.isArray(data.images) ? data.images : []) {
+          if (image?.data && image?.mimeType) content.push({ type: 'image', mimeType: image.mimeType, data: image.data });
+        }
+        return { content };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `看视频失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
 if (cfg.socialV2?.tools?.getSelfImage !== false) {
   server.tool(
     'qq_get_self_image',
