@@ -266,7 +266,18 @@
       "maxLongEdge": 1280,
       "gifFrames": 6,
       "gifTile": 240,
-      "normalizeTimeoutMs": 25000
+      "normalizeTimeoutMs": 25000,
+      "video": {
+        "enabled": true,
+        "maxBytes": 33554432,
+        "maxSeconds": 180,
+        "maxFrames": 18,
+        "maxSheets": 2,
+        "model": "base",
+        "language": "",
+        "timeoutMs": 300000,
+        "maxTranscriptChars": 6000
+      }
     }
   },
   "webSearch": {
