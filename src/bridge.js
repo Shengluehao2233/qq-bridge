@@ -772,6 +772,15 @@ function loadConfig() {
     },
     // 私聊/群聊均未配置白名单时是否放行所有（true 时启动会打警告）
     allowAllWhenEmpty: file.allowAllWhenEmpty === true,
+    // 非管理员碰到"管理层面"的东西时怎么反馈。
+    //   false（默认）＝ 静默丢弃，一句都不回。公共群里别人家机器人的指令（/help、/抽卡…）
+    //                  同样以 "/" 开头，会走进命令分支；回一句"管理命令仅管理员可用"既刷屏，
+    //                  也会暴露这台机器人的存在。
+    //   true  ＝ 旧行为：回一句拒绝提示，方便管理员自己区分"没权限"和"命令没生效"。
+    commands: {
+      ...(file.commands ?? {}),
+      rejectNonOwner: file.commands?.rejectNonOwner === true
+    },
     ackMessage: file.ackMessage ?? '🤔 收到，正在思考…',
     sendDelayMs: file.sendDelayMs ?? 300,
     questionTimeoutMs: file.questionTimeoutMs ?? 5 * 60 * 1000,
@@ -11386,14 +11395,26 @@ async function main() {
 
     // 控制类话语：仅管理员（ownerQQ）可下达；群友触发直接拦截
     if (!isOwner && /进入角色扮演|退出角色扮演|切换角色|设置角色|改角色|换角色|关闭角色扮演|开启角色扮演/.test(plainContent)) {
-      await sendToQQ(key, '角色切换仅管理员可在管理端操作，群内不支持。');
+      // 与上面的 "/" 命令同口径：默认静默丢弃，只有 commands.rejectNonOwner=true 才回提示。
+      if (cfg.commands?.rejectNonOwner) {
+        await sendToQQ(key, '角色切换仅管理员可在管理端操作，群内不支持。');
+      } else {
+        appendActivity(`${key} 忽略非管理员角色指令：${plainContent.slice(0, 40)}`);
+        log(`忽略非管理员角色指令（${key}）：${plainContent.slice(0, 60)}`);
+      }
       return;
     }
 
     // 管理命令：仅管理员（ownerQQ）可用，且由桥接直接执行（硬性，不经过模型）
     if (plainContent.startsWith('/')) {
       if (!isOwner) {
-        await sendToQQ(key, '管理命令仅管理员可用。');
+        // 默认静默：不回任何提示（其它机器人的 "/" 指令也会走到这里）。
+        if (cfg.commands?.rejectNonOwner) {
+          await sendToQQ(key, '管理命令仅管理员可用。');
+        } else {
+          appendActivity(`${key} 忽略非管理员命令 ${String(event.sender?.nickname || event.user_id)}：${plainContent.slice(0, 40)}`);
+          log(`忽略非管理员命令（${key}）：${plainContent.slice(0, 60)}`);
+        }
         return;
       }
       if (plainContent === '/reset' || plainContent === '/new') {

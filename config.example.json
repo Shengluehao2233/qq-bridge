@@ -34,6 +34,9 @@
     "groups": []
   },
   "allowAllWhenEmpty": false,
+  "commands": {
+    "rejectNonOwner": false
+  },
   "ackMessage": "",
   "sendDelayMs": 300,
   "questionTimeoutMs": 300000,
