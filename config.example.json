@@ -35,7 +35,8 @@
   },
   "allowAllWhenEmpty": false,
   "commands": {
-    "rejectNonOwner": false
+    "rejectNonOwner": false,
+    "notifyTurnError": false
   },
   "ackMessage": "",
   "sendDelayMs": 300,

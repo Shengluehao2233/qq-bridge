@@ -779,7 +779,11 @@ function loadConfig() {
     //   true  ＝ 旧行为：回一句拒绝提示，方便管理员自己区分"没权限"和"命令没生效"。
     commands: {
       ...(file.commands ?? {}),
-      rejectNonOwner: file.commands?.rejectNonOwner === true
+      rejectNonOwner: file.commands?.rejectNonOwner === true,
+      // 回合出错（连不上/超时/网关报错）时，是否在群里回一句"我卡了一下"。
+      //   false（默认）＝ 一句都不说，只写本地日志 + 活动记录。
+      //   true  ＝ 旧行为：每个会话每 60 秒最多一句安慰话。
+      notifyTurnError: file.commands?.notifyTurnError === true
     },
     ackMessage: file.ackMessage ?? '🤔 收到，正在思考…',
     sendDelayMs: file.sendDelayMs ?? 300,
@@ -12396,7 +12400,9 @@ async function main() {
                 const safeMsg = shouldAuditKey(key) && SENSITIVE_RE.test(msg) ? '（含敏感信息，已隐藏）' : msg.slice(0, 500);
                 log(`⚠️ agent 处理出错 (${key})：${safeMsg}`);
                 appendActivity(`${key} agent 处理出错（原文只在日志里，未外发）`);
-                if (Date.now() - (errorNoticeAt.get(key) ?? 0) > 60_000) {
+                // commands.notifyTurnError 默认 false：出错时群里一句都不说，
+                // 只留本地日志 + 活动记录（2026-10-30 用户要求关掉"我卡了一下"）。
+                if (cfg.commands?.notifyTurnError === true && Date.now() - (errorNoticeAt.get(key) ?? 0) > 60_000) {
                   errorNoticeAt.set(key, Date.now());
                   await sendToQQ(key, '啊，我这边卡了一下，等下再试');
                 }

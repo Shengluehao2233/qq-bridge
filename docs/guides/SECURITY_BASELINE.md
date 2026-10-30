@@ -34,6 +34,7 @@
 | 配置失败 | `loadConfig()` | `config.json` 缺失/解析失败 → **fail-fast 退出**（不是"用默认值继续跑"） |
 | 管理员识别 | `handleIncoming()` | `String(event.user_id) === String(cfg.ownerQQ ?? '')`；未配置 `ownerQQ` 时启动日志明确告警（审批/管理命令/封闭 agent 全部不可用） |
 | 非管理员命令处理 | `handleIncoming()` + `commands.rejectNonOwner` | 非管理员发 `/xxx`（含 `@机器人 /xxx`，已先归一化）或说"切换角色/进入角色扮演"这类控制话语 → **默认静默丢弃**（只写 `activity` 与日志）；`commands.rejectNonOwner: true` 才回一句拒绝提示。原因：公共群里其它机器人的 `/` 指令也会走到同一分支，默认回话会刷屏并暴露机器人（2026-10-27 用户反馈"任意群友输入命令都有反应"后改） |
+| 回合出错提示 | `handleIncoming()` 的 `ended.reason.kind === 'error'` 分支 + `commands.notifyTurnError` | 连不上/超时/网关报错时**默认一句都不发**（只写日志与 activity）；`commands.notifyTurnError: true` 才每会话每 60 秒回一句"卡了一下"。同时 preset 硬规则禁止回答 `#sl`/`#st` 这类非管理员缩写、禁止在群里播报运行状态（2026-10-30 用户反馈"群友发 `#sl` 会播报状态、连接错误时会说自己卡了"后改） |
 
 ### 2. 工具面（agent 能做什么）
 
