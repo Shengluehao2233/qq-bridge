@@ -30,6 +30,7 @@ import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardR
 import { resolvePriceTable } from './model-prices.js';
 // 文档抽取（群文件/群友发来的文档）：QQ 侧仿真会话没有本地执行能力，文档只能在桥接进程里解析。
 import { extractDocument, sanitizeFileName, docKindOf } from './qq-docs.js';
+import { createMediaCache, cacheKey, settingsFingerprint } from './media-cache.js';
 // TTS（文字转语音）：合成逻辑全在 src/tts/，桥接只负责「谁在什么时候让谁说」。
 import { synthesize as ttsSynthesize, prepareText as ttsPrepareText, normalizeLocale as ttsNormalizeLocale, resolveVoice as ttsResolveVoice, listVoices as ttsListVoices, LOCALE_VOICES, TtsError } from './tts/index.js';
 import { createTokenLedger } from './token-ledger.js';
@@ -8148,6 +8149,47 @@ async function main() {
   // 抽帧/转写的临时目录：放在 state/ 下便于清理，且与音频临时文件同级。
   const VIDEO_TMP_DIR = path.join(STATE_DIR, 'tmp-video');
 
+  // ── 媒体结果缓存（视频理解：关键帧联系表 + 音轨转写）────────────────────────
+  //
+  // 为什么值得缓存：一次视频理解 = 下载 + ffmpeg 抽帧 + Whisper 转写，几十秒起步；
+  // 群里同一段视频被转发两次、或用户隔天再问「看看这个」，没缓存就白算一遍。
+  // 键必须是 **sha256(视频字节) + 设置指纹**：QQ 媒体链接几分钟就过期，按 URL 缓存等于没缓存。
+  // 链接型（yt-dlp 抓 B 站/抖音）没法在下载前算哈希，只能按 URL + 更短有效期缓存（见 media-cache.js）。
+  const MEDIA_CACHE_CFG = (() => {
+    const raw = cfg.socialV2?.media?.cache ?? {};
+    const num = (v, d, min, max) => {
+      const n = Number(v);
+      return Number.isFinite(n) && n > 0 ? Math.min(max, Math.max(min, Math.round(n))) : d;
+    };
+    return {
+      enabled: raw.enabled !== false,
+      dir: path.resolve(ROOT, String(raw.dir ?? 'state/media-cache')),
+      maxBytes: num(raw.maxBytes, 512 * 1024 * 1024, 16 * 1024 * 1024, 8 * 1024 * 1024 * 1024),
+      maxEntries: num(raw.maxEntries, 400, 10, 20_000),
+      maxAgeDays: num(raw.maxAgeDays, 30, 1, 365),
+      urlMaxAgeDays: num(raw.urlMaxAgeDays, 7, 1, 365)
+    };
+  })();
+  const mediaCache = createMediaCache(MEDIA_CACHE_CFG);
+  // 结果形态随这些参数变化 → 参数改了就必须 miss，否则会拿到旧帧数/旧模型的结果。
+  const MEDIA_CACHE_FP = settingsFingerprint({
+    frames: VIDEO_CFG.maxFrames,
+    sheets: VIDEO_CFG.maxSheets,
+    model: VIDEO_CFG.model,
+    language: VIDEO_CFG.language,
+    transcriptChars: VIDEO_CFG.maxTranscriptChars
+  });
+  if (MEDIA_CACHE_CFG.enabled) {
+    try {
+      const pruned = mediaCache.prune();
+      if (pruned.removed) {
+        log(`[cache] 视频缓存淘汰 ${pruned.removed} 项，剩余 ${pruned.entries} 项 / ${formatBytes(pruned.bytes)}`);
+      }
+    } catch (error) {
+      log(`[cache] 淘汰失败：${error?.message ?? error}`);
+    }
+  }
+
   // ── 喂给模型的那一份：体积与动图形态归一化 ────────────────────────────────
   //
   // 为什么必须在这里动手（而不是"让 DSH 自己处理"）：
@@ -8353,6 +8395,47 @@ async function main() {
     return { text: fallbackText };
   }
 
+  // 把缓存里的元数据还原成 digestVideo 的形状，供 formatVideoDigest 复用。
+  function digestFromCache(cached, fallbackProbe) {
+    const meta = cached.meta ?? {};
+    const sheets = (Array.isArray(meta.sheets) ? meta.sheets : [])
+      .map((name) => ({ name, buffer: cached.files?.[name] }))
+      .filter((sheet) => sheet.buffer?.length);
+    return {
+      probe: meta.probe ?? fallbackProbe ?? {},
+      transcript: String(meta.transcript ?? ''),
+      sheets,
+      warning: String(meta.warning ?? '')
+    };
+  }
+
+  // 存缓存：图片按 sheet_NN.jpg 落盘，元数据只存文本。失败只记日志，不影响本次结果。
+  function saveDigestToCache(kind, key, digest, isUrl) {
+    try {
+      const files = {};
+      const sheets = [];
+      digest.sheets.forEach((sheet, i) => {
+        const name = `sheet_${String(i + 1).padStart(2, '0')}.jpg`;
+        files[name] = sheet.buffer;
+        sheets.push(name);
+      });
+      const bytes = Object.values(files).reduce((sum, b) => sum + (b?.length ?? 0), 0);
+      const ok = mediaCache.put(kind, key, {
+        url: !!isUrl,
+        probe: digest.probe ?? {},
+        transcript: digest.transcript ?? '',
+        warning: digest.warning ?? '',
+        sheets
+      }, files);
+      if (ok) {
+        log(`[cache] 已缓存${isUrl ? '链接' : ''}视频结果：${sheets.length} 张联系表 / ${formatBytes(bytes)}`);
+        mediaCache.prune();
+      }
+    } catch (error) {
+      log(`[cache] 写入失败（不影响本次结果）：${error?.message ?? error}`);
+    }
+  }
+
   // 把 digestVideo 的结果整理成「一行描述 + 一段转写」——两种来源（群里视频、链接）共用。
   function formatVideoDigest(digest, index) {
     const transcriptAll = String(digest.transcript ?? '');
@@ -8383,6 +8466,13 @@ async function main() {
       if (buf.length > VIDEO_CFG.maxBytes) {
         return { ok: false, reason: `视频 ${formatBytes(buf.length)} 超过单条上限 ${formatBytes(VIDEO_CFG.maxBytes)}` };
       }
+      // 缓存命中：连探测和转写都省掉，直接从 state/media-cache 还原联系表。
+      const cacheId = cacheKey('video', MEDIA_CACHE_FP, crypto.createHash('sha256').update(buf).digest('hex'));
+      const cached = mediaCache.get('video', cacheId);
+      if (cached && cached.meta?.sheets?.length) {
+        log(`[cache] 视频缓存命中（${cached.meta.hits} 次使用，${formatBytes(buf.length)} 的同一份内容）`);
+        return { ok: true, cached: true, ...formatVideoDigest(digestFromCache(cached), index) };
+      }
       const src = path.join(work, 'input.mp4');
       fs.writeFileSync(src, buf);
       const probe = await probeVideo(src);
@@ -8391,6 +8481,7 @@ async function main() {
       }
       const digest = await digestVideo({ filePath: src, outDir: path.join(work, 'out'), cfg: VIDEO_CFG, onLog: (m) => log(m) });
       if (!digest.ok) return { ok: false, reason: digest.reason || '视频处理失败' };
+      saveDigestToCache('video', cacheId, { ...digest, probe: digest.probe ?? probe });
       return { ok: true, ...formatVideoDigest({ ...digest, probe: digest.probe ?? probe }, index) };
     } finally {
       cleanupVideoWorkDir(work);
@@ -8403,10 +8494,24 @@ async function main() {
     if (!VIDEO_CFG.enabled) return { ok: false, reason: '视频理解已关闭（config.json 的 socialV2.media.video.enabled）' };
     const link = String(url ?? '').trim();
     if (!/^https?:\/\//i.test(link)) return { ok: false, reason: '不是 http(s) 链接' };
+    // 链接型没法在下载前哈希：按「规范化 URL + 设置指纹」缓存，有效期更短（media-cache.js 的 urlMaxAgeDays）。
+    let linkId = link;
+    try {
+      const u = new URL(link);
+      ['spm_id_from', 'vd_source', 'share_source', 'share_medium', 'from', 'pkg', 'timestamp', 't'].forEach((k) => u.searchParams.delete(k));
+      linkId = u.toString();
+    } catch {}
+    const cacheId = cacheKey('video-url', MEDIA_CACHE_FP, linkId);
+    const cached = mediaCache.get('video-url', cacheId);
+    if (cached && cached.meta?.sheets?.length) {
+      log(`[cache] 链接视频缓存命中（${cached.meta.hits} 次使用）：${linkId}`);
+      return { ok: true, cached: true, ...formatVideoDigest(digestFromCache(cached), 1) };
+    }
     const work = makeVideoWorkDir(VIDEO_TMP_DIR);
     try {
       const digest = await digestVideo({ sourceUrl: link, outDir: path.join(work, 'out'), cfg: VIDEO_CFG, onLog: (m) => log(m) });
       if (!digest.ok) return { ok: false, reason: digest.reason || '视频处理失败' };
+      saveDigestToCache('video-url', cacheId, digest, true);
       return { ok: true, ...formatVideoDigest(digest, 1) };
     } finally {
       cleanupVideoWorkDir(work);

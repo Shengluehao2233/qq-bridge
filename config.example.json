@@ -293,6 +293,14 @@
         "language": "",
         "timeoutMs": 300000,
         "maxTranscriptChars": 6000
+      },
+      "cache": {
+        "enabled": true,
+        "dir": "state/media-cache",
+        "maxBytes": 536870912,
+        "maxEntries": 400,
+        "maxAgeDays": 30,
+        "urlMaxAgeDays": 7
       }
     }
   },

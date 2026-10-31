@@ -85,3 +85,45 @@ npm run test-video:live <视频路径>      # 真跑一遍 watch.py（首跑要�
 4. **`（没找到 uv / watch.py）`** → 路径问题，用 `uvPath` / `scriptPath` 显式指定；
 5. 细节日志：`state/tmp-video/…/watch.log`（处理完目录会删，需要时临时把
    `cleanupVideoWorkDir` 跳过，或直接手动跑第 4 节的命令）。
+
+## 6. 结果缓存（`socialV2.media.cache`）
+
+一次视频理解 = 下载 + ffmpeg 抽帧 + Whisper 转写，几十秒起步（本机实测 6 秒样例 7.3 秒）。
+同一段视频被群友转发第二次、或隔天又问「看看这个」，没有缓存就得从头再算一遍。2026-10-31 新增。
+
+**键是什么**
+
+- 群里的视频：`sha256(视频字节) + 设置指纹`。**不能按 URL 缓存**——QQ 媒体链接几分钟就过期，
+  同一段视频每次拿到的 URL 都不同。
+- 链接（B 站/抖音）：下载前无法哈希，只能按「规范化 URL + 设置指纹」缓存，有效期更短
+  （`urlMaxAgeDays`，默认 7 天；作者换片源时旧结果不可信）。规范化会摘掉
+  `spm_id_from / vd_source / share_source / from / timestamp` 等分享参数。
+- 设置指纹包含 `maxFrames / maxSheets / model / language / maxTranscriptChars` ——
+  改这些参数会让旧缓存全部 miss（否则会拿到旧帧数/旧模型的结果）。
+
+**全字段**
+
+| 字段 | 默认 | 说明 |
+| --- | --- | --- |
+| `enabled` | `true` | 总开关；关掉后行为与没有缓存完全一致 |
+| `dir` | `state/media-cache` | 落盘目录（相对仓库根） |
+| `maxBytes` | 512 MiB | 超过就按 LRU 淘汰 |
+| `maxEntries` | 400 | 条数上限 |
+| `maxAgeDays` | 30 | 内容型条目有效期 |
+| `urlMaxAgeDays` | 7 | 链接型条目有效期 |
+
+**行为**
+
+- 命中：日志 `[cache] 视频缓存命中（N 次使用…）`，**跳过下载后的全部处理**，直接把联系表从磁盘读回，
+  实测 2 ms（vs 7322 ms）。
+- 写入：日志 `[cache] 已缓存视频结果：N 张联系表 / X KB`；写完顺手 `prune()`（先删过期，再按
+  `lastUsedAt` 从旧到新淘汰到体积/条数达标）。
+- 坏条目自清：图片文件丢失、`meta.json` 半截写坏 → 读取时判 miss 并删掉整个条目，
+  绝不把半份结果交给模型。
+- 落盘用 `.tmp → rename`，rename 被占用时退回 `copyFile`（OneDrive/杀软场景）。
+
+**排错**
+
+1. 一直不命中 → 看日志有没有 `[cache]`；同一视频两次的 `sha256` 应一致。
+2. 磁盘涨得快 → 调小 `maxBytes` / `maxEntries`；`state/media-cache` 可以直接整个删掉重建。
+3. 想立刻清空 → `rm -rf state/media-cache`，或临时 `enabled:false` 跑一轮。
