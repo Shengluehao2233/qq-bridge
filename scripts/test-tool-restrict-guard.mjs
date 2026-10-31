@@ -1,14 +1,17 @@
-// qq-tool-restrict 守卫的回归（2026-10-18 新增）。
+// qq-tool-restrict 守卫的回归（2026-10-18 新增；2026-10-31 改为「整批 restrict」后重写）。
 //
 // 背景：一份重启后**新建**的 QQ 会话，请求头里 `dev_*` 仍然是 18 个
 // （docs/audits/AUDIT_2026-10-18_MEDIA_AND_WATERMARK.md §3 P3）。
-// 名单本身是对的、加载的副本也含这些名字，所以失败在 `ctx.tools.restrict()` 调用期，
-// 被 per-name try/catch 静默吞掉 —— 现网完全不可观测（DSH 的 stderr 不落文件）。
+// 失败发生在 `ctx.tools.restrict()` 调用期、被 per-name try/catch 静默吞掉 →
+// 现网完全不可观测（DSH 的 stderr 不落文件）。
 //
-// 本文件用桩 ctx 验证守卫现在的行为：
-//   1. restrict 抛错时**不静默**：写诊断文件、并 3 秒后对失败项重试一次；
-//   2. 时序问题（后注册的工具）能被重试补上；
-//   3. 执行期 guard 白名单照旧：mcp__* 放行、dev_* 拒绝。
+// 2026-10-31 起实现改了策略，本文件同步改成验证新契约：
+//   1. 先整批 restrict 一次；被「unknown global tool」拒绝时，从报错里的
+//      known-globals 清单解析出真实存在的名字，再整批 restrict 交集（2 次调用搞定）；
+//   2. 真的藏不掉时**不静默**：写诊断文件 + 3 秒后重试；
+//   3. 全部成功时不写诊断文件（不制造噪声）；
+//   4. 同一个 tools 服务重复 apply 只注册一次（现网装载两次），不同 ctx 照常注册；
+//   5. 执行期 guard 白名单照旧：mcp__* 放行、dev_* 与本地工具拒绝。
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -35,39 +38,58 @@ async function loadPlugin(diagFile) {
   return mod;
 }
 
-function makeCtx({ restrictImpl, knownAfter = Infinity }) {
-  const calls = { restrict: [], guard: null, hidden: new Set() };
-  let round = 0;
+/**
+ * 桩 ctx：restrict 现在可能一次收到一整批名字，所以按 deny 数组记账。
+ * @param {(names: string[]) => Error|undefined} restrictImpl 返回 Error 表示抛错
+ */
+function makeCtx({ restrictImpl = () => undefined } = {}) {
+  const calls = { restrict: [], batches: [], guard: null, hidden: new Set() };
   const ctx = {
     tools: {
       restrict(filter) {
-        const name = filter?.deny?.[0];
-        calls.restrict.push(name);
-        round += 1;
-        const result = restrictImpl({ name, round });
+        const names = Array.isArray(filter?.deny) ? filter.deny : [];
+        calls.restrict.push(...names);
+        calls.batches.push(names);
+        const result = restrictImpl(names);
         if (result instanceof Error) throw result;
-        calls.hidden.add(name);
+        for (const name of names) calls.hidden.add(name);
         return () => {};
       },
       guard(fn) { calls.guard = fn; }
     }
   };
-  return { ctx, calls, knownAfter };
+  return { ctx, calls };
 }
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-tool-restrict-'));
 
-await test('restrict 全失败时不静默：写诊断文件 + 3 秒后重试', async () => {
+await test('报错里带 known-globals 时走整批交集：只 restrict 真实存在的名字（2 次调用）', async () => {
+  const diag = path.join(tmpDir, 'diag-known.log');
+  const mod = await loadPlugin(diag);
+  const known = ['list_mcp_resources', 'read_mcp_resource', 'working_directory'];
+  const { ctx, calls } = makeCtx({
+    restrictImpl: (names) => {
+      const unknown = names.filter((n) => !known.includes(n));
+      if (!unknown.length) return undefined;
+      return new Error(`tools.restrict() names unknown global tool "${unknown[0]}"; known global tools: ${known.join(', ')}`);
+    }
+  });
+  mod.apply(ctx);
+  // 第一次整批（全部名字）被拒，第二次是交集（3 个名字）成功
+  assert.deepEqual([...calls.hidden].sort(), [...known].sort(), `应只藏掉真实存在的 3 个，实际 ${[...calls.hidden]}`);
+  assert.equal(calls.batches.length, 2, '应该只调用两次：整批被拒 + 交集成功');
+  assert.deepEqual([...calls.batches[1]].sort(), [...known].sort(), '第二次只 restrict 交集');
+  assert.equal(fs.existsSync(diag), false, '没有真正失败时不该写诊断文件');
+});
+
+await test('报错里没有 known-globals 时退回逐个尝试，并写诊断文件 + 3 秒后重试', async () => {
   const diag = path.join(tmpDir, 'diag-always-fail.log');
   const mod = await loadPlugin(diag);
-  // 前 N 次（第一次 apply 的所有名字）都报「unknown global tool」，重试阶段也失败
-  const { ctx, calls } = makeCtx({ restrictImpl: () => new Error('tools.restrict() names unknown global tool "x"') });
+  const { ctx } = makeCtx({ restrictImpl: () => new Error('tools.restrict() names unknown global tool "x"') });
   mod.apply(ctx);
-  assert.ok(calls.restrict.length > 0, '必须真的调用 restrict');
   const first = fs.readFileSync(diag, 'utf8');
-  assert.match(first, /restrict ok=0 failed=\d+/, `诊断文件应记录失败计数：${first}`);
+  assert.match(first, /restrict ok=0 absent=0 failed=\d+/, `诊断文件应记录失败计数：${first}`);
   assert.match(first, /unknown global tool/, '诊断文件必须带 DSH 的原始报错');
-  // 等延迟重试落地
   await new Promise((resolve) => setTimeout(resolve, 3400));
   const after = fs.readFileSync(diag, 'utf8');
   assert.match(after, /延迟重试 ok=0/, `重试结果也要落盘：${after}`);
@@ -77,12 +99,13 @@ await test('时序问题能被 3 秒后的重试补藏（工具晚注册）', as
   const diag = path.join(tmpDir, 'diag-late.log');
   const mod = await loadPlugin(diag);
   const total = mod.RESTRICTED_TOOL_NAMES.length;
-  // 第一轮全部失败（模拟全局工具还没注册），第二轮全部成功（模拟 3 秒后注入器已注册）
+  let ready = false;
   const { ctx, calls } = makeCtx({
-    restrictImpl: ({ round }) => (round <= total ? new Error('unknown global tool') : undefined)
+    restrictImpl: () => (ready ? undefined : new Error('unknown global tool'))
   });
   mod.apply(ctx);
   assert.equal(calls.hidden.size, 0, '第一轮应当一个都没藏掉');
+  ready = true;
   await new Promise((resolve) => setTimeout(resolve, 3400));
   assert.equal(calls.hidden.size, total, `重试后应全部藏掉，实际 ${calls.hidden.size}/${total}`);
   const log = fs.readFileSync(diag, 'utf8');
@@ -92,16 +115,30 @@ await test('时序问题能被 3 秒后的重试补藏（工具晚注册）', as
 await test('restrict 一次成功时不写诊断文件（不制造噪声）', async () => {
   const diag = path.join(tmpDir, 'diag-ok.log');
   const mod = await loadPlugin(diag);
-  const { ctx, calls } = makeCtx({ restrictImpl: () => undefined });
+  const { ctx, calls } = makeCtx();
   mod.apply(ctx);
   assert.equal(calls.hidden.size, mod.RESTRICTED_TOOL_NAMES.length);
   assert.equal(fs.existsSync(diag), false, '全部成功时不该产生诊断文件');
 });
 
+await test('每个 preset 各自的 ctx 都要注册（不能跨 ctx 去重）', async () => {
+  const diag = path.join(tmpDir, 'diag-dup.log');
+  const mod = await loadPlugin(diag);
+  const first = makeCtx();
+  mod.apply(first.ctx);
+  assert.equal(typeof first.calls.guard, 'function', '第一个 ctx 必须注册 guard');
+  assert.equal(first.calls.restrict.length, mod.RESTRICTED_TOOL_NAMES.length, '第一个 ctx 必须 restrict');
+  // 现网是两个 preset 行各自一个 ctx：第二个也必须完整注册（跳过一个 = 那个 preset 裸奔）
+  const second = makeCtx();
+  mod.apply(second.ctx);
+  assert.equal(typeof second.calls.guard, 'function', '第二个 ctx 必须注册 guard');
+  assert.equal(second.calls.restrict.length, mod.RESTRICTED_TOOL_NAMES.length, '第二个 ctx 必须 restrict');
+});
+
 await test('执行期 guard 照旧：QQ MCP 放行、dev_* 与本地工具拒绝', async () => {
   const diag = path.join(tmpDir, 'diag-guard.log');
   const mod = await loadPlugin(diag);
-  const { ctx, calls } = makeCtx({ restrictImpl: () => undefined });
+  const { ctx, calls } = makeCtx();
   mod.apply(ctx);
   assert.equal(typeof calls.guard, 'function', '必须注册执行期 guard');
   const guard = calls.guard;

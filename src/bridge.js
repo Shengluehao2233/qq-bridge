@@ -31,6 +31,8 @@ import { resolvePriceTable } from './model-prices.js';
 // 文档抽取（群文件/群友发来的文档）：QQ 侧仿真会话没有本地执行能力，文档只能在桥接进程里解析。
 import { extractDocument, sanitizeFileName, docKindOf } from './qq-docs.js';
 import { createMediaCache, cacheKey, settingsFingerprint } from './media-cache.js';
+// 管理员命令表（/help 由它渲染）+ 日志尾巴读取。清单是数据：加命令只改 admin-commands.js。
+import { ADMIN_COMMANDS, renderAdminHelp, renderStatus, tailLines as readTailLines } from './admin-commands.js';
 // TTS（文字转语音）：合成逻辑全在 src/tts/，桥接只负责「谁在什么时候让谁说」。
 import { synthesize as ttsSynthesize, prepareText as ttsPrepareText, normalizeLocale as ttsNormalizeLocale, resolveVoice as ttsResolveVoice, listVoices as ttsListVoices, LOCALE_VOICES, TtsError } from './tts/index.js';
 import { createTokenLedger } from './token-ledger.js';
@@ -1330,6 +1332,18 @@ function localClock(atMs = Date.now()) {
 
 const appendBridgeLog = createCappedLogger(BRIDGE_LOG, 2000);
 
+/**
+ * stdout 是否连着终端。
+ *
+ * 以前 log() 无条件 console.log，而启动脚本又把 stdout 重定向到
+ * `dsh-qq-logs\bridge-<随便起的名字>.log` —— 同一行日志在 state\bridge.log 和那个
+ * 重定向文件里各存一份；重定向文件没有行数上限、名字每次启动都变，翻日志时根本
+ * 不知道哪份是今天的。现在：TTY（双击 start.bat）才回显，后台/重定向只写权威日志。
+ */
+const STDOUT_IS_TTY = (() => {
+  try { return Boolean(process.stdout.isTTY); } catch { return false; }
+})();
+
 function log(...args) {
   let line;
   try {
@@ -1343,8 +1357,27 @@ function log(...args) {
   }
   // console.log 必须自成一个 try：stdout 的读者（守护窗口）消失时会抛 EPIPE，
   // 而 log() 是从 socket 事件回调里被调用的 —— 一旦抛出就会变成未捕获异常把进程带走。
-  try { console.log(line); } catch {}
+  if (STDOUT_IS_TTY) { try { console.log(line); } catch {} }
   appendBridgeLog(`${line}\n`);
+}
+
+/**
+ * 限流日志：同一个 key 在窗口内只逐条输出第一条，其余只计数；窗口过期后补一行
+ * 「上一窗口另有 N 条」。专治「忽略未授权会话 group:xxx」这类同一原因反复刷屏
+ * （实测 3000 行日志里有 23 条是同一个群）。
+ */
+const logThrottleState = new Map();
+function logThrottled(key, windowMs, ...args) {
+  const now = Date.now();
+  const st = logThrottleState.get(key) ?? { startAt: 0, count: 0 };
+  if (!st.startAt || now - st.startAt >= windowMs) {
+    if (st.count > 1) log(`（「${key}」在上一 ${Math.round(windowMs / 1000)} 秒窗口内另有 ${st.count - 1} 条同类日志未逐条输出）`);
+    log(...args);
+    logThrottleState.set(key, { startAt: now, count: 1 });
+    return;
+  }
+  st.count += 1;
+  logThrottleState.set(key, st);
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const convKey = (kind, id) => `${kind}:${id}`;
@@ -11619,7 +11652,8 @@ async function main() {
   async function handleIncoming(kind, id, event, cfg) {
     const key = convKey(kind, id);
     if (!modeAllowed(key, kind, id, cfg, currentMode)) {
-      log(`忽略未授权会话 ${key}（当前模式 ${currentMode}，来自 ${event.user_id}）`);
+      // 限流：同一个未授权会话反复发消息时，日志只留一条 + 计数，别让它把 2000 行日志吃光。
+      logThrottled(`未授权会话 ${key}`, 60_000, `忽略未授权会话 ${key}（当前模式 ${currentMode}，来自 ${event.user_id}）`);
       return;
     }
     const resolveAtName = async (qq) => {
@@ -11684,7 +11718,7 @@ async function main() {
         await sendToQQ(key, '角色切换仅管理员可在管理端操作，群内不支持。');
       } else {
         appendActivity(`${key} 忽略非管理员角色指令：${plainContent.slice(0, 40)}`);
-        log(`忽略非管理员角色指令（${key}）：${plainContent.slice(0, 60)}`);
+        logThrottled(`非管理员角色指令 ${key}`, 60_000, `忽略非管理员角色指令（${key}）：${plainContent.slice(0, 60)}`);
       }
       return;
     }
@@ -11697,8 +11731,56 @@ async function main() {
           await sendToQQ(key, '管理命令仅管理员可用。');
         } else {
           appendActivity(`${key} 忽略非管理员命令 ${String(event.sender?.nickname || event.user_id)}：${plainContent.slice(0, 40)}`);
-          log(`忽略非管理员命令（${key}）：${plainContent.slice(0, 60)}`);
+          logThrottled(`非管理员命令 ${key}`, 60_000, `忽略非管理员命令（${key}）：${plainContent.slice(0, 60)}`);
         }
+        return;
+      }
+      // /help —— 所有管理命令的入口。命令清单一律来自 src/admin-commands.js（数据驱动），
+      // 这里只负责发出去；加命令不需要再改这段。
+      if (plainContent === '/help' || plainContent === '/?' || plainContent === '/命令') {
+        await sendToQQ(key, renderAdminHelp());
+        return;
+      }
+      // /log [n] —— 远程看日志尾巴（在群里排障用，不必去翻磁盘）。
+      // 默认 30 行、最多 200 行；总长度再压到 3000 字，避免被 QQ 拆成十几条。
+      if (plainContent === '/log' || plainContent === '/logs' || plainContent.startsWith('/log ') || plainContent.startsWith('/logs ')) {
+        const arg = plainContent.replace(/^\/logs?\s*/, '').trim();
+        const want = /^\d+$/.test(arg) ? Number(arg) : 30;
+        const n = Math.min(200, Math.max(1, want));
+        const tail = readTailLines(BRIDGE_LOG, n);
+        if (!tail.ok) {
+          await sendToQQ(key, `读日志失败：${tail.error}`);
+          return;
+        }
+        let body = tail.lines.join('\n');
+        if (body.length > 3000) body = `…（前文省略）\n${body.slice(-3000)}`;
+        await sendToQQ(key, `日志末尾 ${tail.lines.length} 行（${path.basename(BRIDGE_LOG)}）：\n${body}`);
+        return;
+      }
+      // /pause · /resume —— 暂停/恢复二代 AI 的主动发言。
+      // 语义与控制台 POST /api/socialV2/activity 完全一致：暂停时停掉唤醒/等待/冷场计时器，
+      // 但消息**照常入库**（恢复后能读未读），不是丢消息。
+      if (plainContent === '/pause' || plainContent === '/resume') {
+        const wantPause = plainContent === '/pause';
+        if (socialV2.paused === wantPause) {
+          await sendToQQ(key, wantPause ? 'AI 已经是暂停状态（/resume 恢复）。' : 'AI 现在是正常状态（/pause 可暂停）。');
+          return;
+        }
+        socialV2.paused = wantPause;
+        if (wantPause) {
+          clearAllSocialV2Timers();
+          log('管理员命令：二代 AI 已暂停（唤醒/等待任务已停止）');
+        } else {
+          log('管理员命令：二代 AI 已恢复');
+          for (const ck of socialV2.conversations.keys()) {
+            setupSleepTimerV2(ck);
+            scheduleProactiveCheckV2(ck);
+          }
+        }
+        saveSocialV2State();
+        await sendToQQ(key, wantPause
+          ? 'AI 已暂停：消息继续入库（恢复后能读未读），但不会主动发言。发 /resume 恢复。'
+          : 'AI 已恢复：新消息会照常参与。');
         return;
       }
       if (plainContent === '/reset' || plainContent === '/new') {
@@ -11757,7 +11839,31 @@ async function main() {
       }
       if (plainContent === '/status') {
         const rs = readRoleState();
-        await sendToQQ(key, `会话 ${state.sessions[key] ?? '未创建'}；白名单 ${allowed(kind, id, cfg) ? '通过' : '拦截'}；角色 ${rs.role ?? '无'}；模式 ${rs.mode}`);
+        const version = (() => {
+          try { return JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version ?? '?'; } catch { return '?'; }
+        })();
+        const q = promptQueues.get(key);
+        const mcp = (() => {
+          try { return JSON.parse(fs.readFileSync(path.join(STATE_DIR, 'mcp-tools.json'), 'utf8')); } catch { return null; }
+        })();
+        const logKB = (() => {
+          try { return Math.round(fs.statSync(BRIDGE_LOG).size / 1024); } catch { return null; }
+        })();
+        await sendToQQ(key, renderStatus({
+          version,
+          mode: currentMode,
+          dshReady,
+          sessionId: state.sessions[key] ?? null,
+          queueLen: q?.queue?.length ?? 0,
+          running: q?.running === true,
+          whitelistOk: allowed(kind, id, cfg),
+          role: rs.role,
+          speakMode: rs.mode,
+          paused: socialV2.paused === true,
+          voice: (() => { try { return voiceCfg().enabled; } catch { return false; } })(),
+          mcpTools: mcp?.count ?? null,
+          logKB
+        }));
         return;
       }
       if (plainContent === '/role' || plainContent.startsWith('/role ')) {
@@ -13042,6 +13148,16 @@ async function main() {
     // 日志里的「token 自愈失败」与 config.json 的 snowluma.homeDir。
     log(`SnowLuma 首次连接未成功（将在后台自动重连并尝试自愈 WS token）: ${error?.message ?? error}`);
   });
+  // 启动横幅：把「这份日志属于哪次启动」写进日志本身。
+  // 没有横幅时，一份 bridge.log 只能靠时间戳猜是怎么起的（哪个模式、哪个 DSH、哪个端口）。
+  const pkgVersion = (() => {
+    try { return JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version ?? '?'; } catch { return '?'; }
+  })();
+  log(`══ 桥接启动 v${pkgVersion} ══ 模式 ${currentMode} · 控制台 :${cfg.consolePort ?? 3100} · DSH ${cfg.dsh?.baseUrl ?? '(未配置)'} · ownerQQ ${cfg.ownerQQ ?? '(未配置)'}`);
+  // 用**相对路径**：log() 会过 redactSensitiveText（绝对路径一律打码成 ***），
+  // 这个打码是 /log 把日志发到群里时的隐私底线（不能让群友看到 C:\Users\... 目录结构），
+  // 所以不为了启动横幅好看去关掉它；横幅里写相对于仓库根的路径同样能定位。
+  log(`日志：state\\bridge.log（2000 行后轮转到 .1）· 活动日志：state\\qq-activity.log${STDOUT_IS_TTY ? '' : '（非终端运行：只写文件，不回显）'}`);
   log('桥接已启动。按 Ctrl+C 退出。');
   // 预热表情库：启动时同步一次 QQ 收藏表情，失败不阻塞（AI 首次调用工具时还会再试）。
   if (cfg.socialV2?.sticker?.enabled !== false) {
