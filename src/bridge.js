@@ -32,7 +32,9 @@ import { resolvePriceTable } from './model-prices.js';
 import { extractDocument, sanitizeFileName, docKindOf } from './qq-docs.js';
 import { createMediaCache, cacheKey, settingsFingerprint } from './media-cache.js';
 // 管理员命令表（/help 由它渲染）+ 日志尾巴读取。清单是数据：加命令只改 admin-commands.js。
-import { ADMIN_COMMANDS, renderAdminHelp, renderStatus, tailLines as readTailLines } from './admin-commands.js';
+import { ADMIN_COMMANDS, renderAdminHelp, renderStatus, tailLines as readTailLines, commandTierOf, normalizeAdmins, normalizeOwnerQQ } from './admin-commands.js';
+// 控制台令牌注册表（一人一令牌，存 sha256）。纯函数，可单测。
+import { hashAdminToken, describeAdminTokens, issueAdminToken, revokeAdminTokens, readAdminTokenRegistry, writeAdminTokenRegistry } from './admin-tokens.js';
 // TTS（文字转语音）：合成逻辑全在 src/tts/，桥接只负责「谁在什么时候让谁说」。
 import { synthesize as ttsSynthesize, prepareText as ttsPrepareText, normalizeLocale as ttsNormalizeLocale, resolveVoice as ttsResolveVoice, listVoices as ttsListVoices, LOCALE_VOICES, TtsError } from './tts/index.js';
 import { createTokenLedger } from './token-ledger.js';
@@ -84,6 +86,12 @@ const TOOL_LOG_FILE = path.join(STATE_DIR, 'tool-calls.jsonl');
 const TOKEN_USAGE_FILE = path.join(STATE_DIR, 'token-usage.jsonl');
 const ACTIVITY_LOG = path.join(STATE_DIR, 'qq-activity.log');
 const BRIDGE_LOG = path.join(STATE_DIR, 'bridge.log');
+// 管理动作审计（2026-10-31）：谁在什么时候执行了什么管理命令。
+// 只记 QQ 号 / 命令名 / 结果，**绝不记消息正文和令牌**——审计文件会被控制台展示。
+const ADMIN_AUDIT_LOG = path.join(STATE_DIR, 'admin-audit.log');
+// 控制台身份令牌：主管理一人一个（存 sha256 哈希，明文只在签发时显示一次）。
+// 读/写/签发/吊销/摘要都在 src/admin-tokens.js（纯函数，可单测）。
+const ADMIN_TOKENS_FILE = path.join(STATE_DIR, 'admin-tokens.json');
 
 /**
  * 模式拼写的**唯一**归一入口（输入边界）。
@@ -717,23 +725,13 @@ function writeVoiceState(patch) {
   return next;
 }
 
-// 管理员 QQ（ownerQQ）规范化：空值=未设置；必须是正整数 QQ 号。
-function normalizeOwnerQQ(value) {
-  if (value === undefined || value === null) return null;
-  const s = String(value).trim();
-  if (!s) return null;
-  if (!/^\d+$/.test(s)) throw new Error('ownerQQ 必须是 QQ 号（正整数）');
-  const n = Number(s);
-  if (!Number.isSafeInteger(n) || n <= 0) throw new Error('ownerQQ 必须是 QQ 号（正整数）');
-  return n;
-}
-
 // 白名单/黑名单值规范化：只接受字符串或数字数组，非数组按空列表处理（fail-closed 语义由调用方决定）。
+// 管理员 QQ 规范化（normalizeOwnerQQ）与分级归一化（normalizeAdmins）在 admin-commands.js，
+// 因为它们是纯函数、要被单测覆盖，而 bridge.js 一 import 就会跑起来，没法直接测。
 function normalizeIdList(value) {
   if (!Array.isArray(value)) return [];
   return value.map((v) => String(v).trim()).filter((v) => /^\d+$/.test(v));
 }
-
 // ── 配置 ────────────────────────────────────────────────────────────────────
 function loadConfig() {
   const p = path.join(ROOT, 'config.json');
@@ -767,6 +765,9 @@ function loadConfig() {
     agentPreset: file.agentPreset ?? 'qq-chat',
     workspaceTitle: file.workspaceTitle ?? 'QQ 聊天',
     ownerQQ: normalizeOwnerQQ(file.ownerQQ),
+    // 管理员分级。owners 为空时自动回落到 ownerQQ（见 normalizeAdmins），
+    // 所以老配置不写 admins 段也完全等价于「只有 ownerQQ 一个主管理」。
+    admins: normalizeAdmins(file.admins, normalizeOwnerQQ(file.ownerQQ)),
     allow: {
       private: normalizeIdList(file.allow?.private ?? file.allow?.privates ?? []),
       groups: normalizeIdList(file.allow?.groups ?? file.allow?.group ?? [])
@@ -1332,6 +1333,13 @@ function localClock(atMs = Date.now()) {
 
 const appendBridgeLog = createCappedLogger(BRIDGE_LOG, 2000);
 
+/** 本地时间 YYYY-MM-DD HH:MM:SS（审计用；日志正文仍用 localClock 的短格式）。 */
+function localStamp(atMs = Date.now()) {
+  const d = new Date(atMs);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
 /**
  * stdout 是否连着终端。
  *
@@ -1579,6 +1587,130 @@ async function main() {
   sweepStaleVideoDirs(path.join(STATE_DIR, 'tmp-video'));
   acquireLock();
   loadState();
+
+  // ── 管理员分级（2026-10-31）──────────────────────────────────────────────
+  // 权限真值永远是 cfg.admins；这里只维护「QQ → 角色」索引，名单一改就重建。
+  // 不每次现算的原因：命令分发在每条消息上跑，遍历数组没必要。
+  const adminIndex = new Map();
+  const rebuildAdminIndex = () => {
+    adminIndex.clear();
+    for (const qq of cfg.admins?.owners ?? []) adminIndex.set(String(qq), 'owner');
+    for (const qq of cfg.admins?.managers ?? []) if (!adminIndex.has(String(qq))) adminIndex.set(String(qq), 'manager');
+  };
+  rebuildAdminIndex();
+  /**
+   * QQ 号 → 角色。'owner'=主管理，'manager'=普通管理（只能 pause/resume），'user'=普通群友。
+   * 注意：身份只看 SnowLuma 服务端填的 user_id，不看群名片/昵称（昵称谁都能改）。
+   * @returns {'owner'|'manager'|'user'}
+   */
+  const roleOf = (userId) => adminIndex.get(String(userId ?? '')) ?? 'user';
+  const appendAdminAudit = createCappedLogger(ADMIN_AUDIT_LOG, 2000);
+  /** 写一行审计：时间 · 角色 · QQ · 动作 · 结果。不记正文、不记令牌。 */
+  const auditAdmin = (actorQQ, role, action, result = 'ok') => {
+    if (cfg.admins?.audit === false) return;
+    try { appendAdminAudit(`${localStamp()} ${role} ${actorQQ} ${action} ${result}\n`); } catch {}
+  };
+  // pause/resume 的滥用闸门：每人 10 秒冷却 + 每小时 20 次。普通管理只能碰这两条命令，
+  // 不设限的话两个管理员能把 AI 反复停/开成拨浪鼓，而且日志里全是噪音。
+  const adminCommandWindow = new Map(); // qq -> number[]（最近执行时刻，毫秒）
+  const ADMIN_CMD_COOLDOWN_MS = 10_000;
+  const ADMIN_CMD_HOURLY_MAX = 20;
+  const adminCommandAllowed = (qq) => {
+    const now = Date.now();
+    const recent = (adminCommandWindow.get(qq) ?? []).filter((t) => now - t < 3_600_000);
+    if (recent.length && now - recent[recent.length - 1] < ADMIN_CMD_COOLDOWN_MS) {
+      adminCommandWindow.set(qq, recent);
+      return { ok: false, reason: 'cooldown' };
+    }
+    if (recent.length >= ADMIN_CMD_HOURLY_MAX) {
+      adminCommandWindow.set(qq, recent);
+      return { ok: false, reason: 'hourly' };
+    }
+    recent.push(now);
+    adminCommandWindow.set(qq, recent);
+    return { ok: true };
+  };
+  // 名单热更新：控制台改完 config.json 后 3 秒内生效，不需要重启桥接。
+  // 只比较 mtime，不轮询内容，开销可忽略。
+  const configPath = path.join(ROOT, 'config.json');
+  let adminsMtimeMs = 0;
+  try { adminsMtimeMs = fs.statSync(configPath).mtimeMs; } catch {}
+  const refreshAdminsFromDisk = () => {
+    let mtimeMs = 0;
+    try { mtimeMs = fs.statSync(configPath).mtimeMs; } catch { return false; }
+    if (mtimeMs === adminsMtimeMs) return false;
+    adminsMtimeMs = mtimeMs;
+    const file = readJsonSafe(configPath, null, true);
+    if (!file || typeof file !== 'object' || Array.isArray(file)) return false;
+    const next = normalizeAdmins(file.admins, normalizeOwnerQQ(file.ownerQQ));
+    if (JSON.stringify(next) === JSON.stringify(cfg.admins)) return false;
+    cfg.admins = next;
+    rebuildAdminIndex();
+    log(`管理员名单已重新载入：主管理 ${next.owners.join(',') || '无'}；普通管理 ${next.managers.join(',') || '无'}`);
+    return true;
+  };
+  setInterval(() => { try { refreshAdminsFromDisk(); } catch {} }, 3_000).unref();
+
+  /**
+   * 普通管理执行 /pause 后私聊通知所有主管理。
+   *
+   * 为什么要通知：普通管理只有 pause/resume 两个权限，一旦在群里把 AI 停了，
+   * 主管理如果不在群里就完全看不见——只能靠"怎么不说话了"来猜。
+   * 通知失败绝不能反过来影响命令本身（私聊可能有验证/未加好友等限制），
+   * 所以逐人 try/catch，失败只写日志。
+   */
+  const notifyOwnersOfManagerPause = async (actorName, actorQQ, sourceKey) => {    const owners = (cfg.admins?.owners ?? []).map(String).filter(Boolean);
+    if (!owners.length) return;
+    const target = String(sourceKey ?? '').startsWith('group:') ? `群 ${String(sourceKey).slice(6)}` : sourceKey;
+    const when = localStamp();
+    for (const qq of owners) {
+      try {
+        await sendToQQ(`private:${qq}`, `[管理通知] ${actorName}（${actorQQ}）在 ${target} 执行了 /pause（${when}）。\n发 /resume 恢复；/status 看当前状态。`);
+      } catch (error) {
+        log(`私聊通知主管理 ${qq} 失败：${error?.message ?? error}`);
+      }
+    }
+  };
+
+  // ── 控制台身份（2026-10-31）：令牌 → 是谁 ────────────────────────────────
+  // 共享 consoleToken 无法追责（日志里也只知道"有个控制台操作"）。分级之后主管理可能
+  // 有多个人，所以改成一人一令牌：注册表存 sha256，签发时把明文显示一次，之后谁都拿不回。
+  // 兼容：旧 consoleToken 仍然可用，映射到 admins.owners[0]（老书签不用改）。
+  let adminTokens = readAdminTokenRegistry(ADMIN_TOKENS_FILE);
+  const saveAdminTokens = () => { try { writeAdminTokenRegistry(ADMIN_TOKENS_FILE, adminTokens); } catch (error) { log(`保存管理员令牌失败：${error?.message ?? error}`); } };
+  /**
+   * 令牌 → 身份。返回 { qq, name, role, via } 或 null。
+   *
+   * `sharedToken` 由调用方传进来（而不是抓外层变量）：共享令牌是在控制台服务启动时才
+   * 确定/生成的，而本函数定义在前面；早先直接引用外层 consoleToken 会在第一个请求上
+   * 抛 `ReferenceError: consoleToken is not defined`（实测踩过一次）。
+   *
+   * 注意：这里**不**顺带检查"这个 QQ 还在不在 owners 名单里"——名单一改，
+   * 吊销就由 /api/admins 显式删令牌，避免"删了名单却因为令牌还在而能进控制台"。
+   */
+  const identifyConsoleToken = (supplied, sharedToken) => {
+    const token = String(supplied ?? '');
+    if (!token) return null;
+    const ownerQQ = cfg.admins?.owners?.[0] ?? null;
+    const shared = String(sharedToken ?? '');
+    if (shared) {
+      const a = Buffer.from(token, 'utf8');
+      const b = Buffer.from(shared, 'utf8');
+      if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
+        return { qq: ownerQQ, name: '共享令牌', role: 'owner', via: 'consoleToken' };
+      }
+    }
+    const hash = hashAdminToken(token);
+    const rec = adminTokens[hash];
+    if (!rec) return null;
+    // lastUsedAt 只在间隔超过 60 秒时回写，避免每个请求都写一次磁盘。
+    const now = Date.now();
+    if (now - rec.lastUsedAt > 60_000) {
+      rec.lastUsedAt = now;
+      saveAdminTokens();
+    }
+    return { qq: rec.qq, name: rec.name || String(rec.qq), role: 'owner', via: 'admin-token' };
+  };
 
   // ── 群聊黑话/网络用语学习（slang） ──────────────────────────────────────
   let slangEntries = [];
@@ -3659,15 +3791,12 @@ async function main() {
       // 控制台鉴权：所有请求需带 x-console-token 或 ?token=
       // 定长比较：`!==` 会在第一个不同的字符处短路，理论上可被本机进程用响应时延逐字节试探。
       // 令牌是 192 bit 随机值且只监听回环，所以这是纵深防御而非在野漏洞。
+      //
+      // 2026-10-31 起支持「主管理一人一令牌」：identifyConsoleToken 先比共享 consoleToken
+      // （兼容老书签），再查 state/admin-tokens.json 的 sha256 注册表，返回身份（谁在操作）。
       const suppliedToken = String(url.searchParams.get('token') ?? req.headers['x-console-token'] ?? '');
-      const tokenMatches = (() => {
-        if (!consoleToken) return false; // 上面已拒绝空令牌；真出现也只许失败关闭，绝不 return true
-        const a = Buffer.from(suppliedToken, 'utf8');
-        const b = Buffer.from(consoleToken, 'utf8');
-        if (a.length !== b.length) return false;
-        return crypto.timingSafeEqual(a, b);
-      })();
-      if (consoleToken && !tokenMatches) {
+      const consoleIdentity = identifyConsoleToken(suppliedToken, consoleToken);
+      if (!consoleIdentity) {
         if (req.method === 'GET' && url.pathname === '/') {
           // 静态页面本身不含机密（真正的门在 /api 下的各接口上），所以这里仍然把页面给出去，
           // 由前端显示「需要令牌」的输入条。
@@ -4586,6 +4715,94 @@ async function main() {
           cfg.security = { ...(cfg.security ?? {}), ...next };
           log(`控制台：安全拦截通知已更新（interceptNotify=${cfg.security.interceptNotify}）`);
           sendJson({ ok: true, security: cfg.security });
+          return;
+        }
+        // ── 控制台身份：我是谁（前端用它显示当前登录者、决定能不能改名单） ────────
+        if (req.method === 'GET' && url.pathname === '/api/me') {
+          sendJson({
+            ok: true,
+            me: { qq: consoleIdentity.qq ?? null, name: consoleIdentity.name ?? '', role: consoleIdentity.role, via: consoleIdentity.via }
+          });
+          return;
+        }
+        // ── 管理员名单（主管理 / 普通管理）────────────────────────────────────
+        // 只有主管理能看能改；普通管理按需求**不进控制台**，所以这里不需要区分"普通管理视图"。
+        if (url.pathname === '/api/admins' || url.pathname.startsWith('/api/admins/')) {
+          if (consoleIdentity.role !== 'owner') {
+            sendJson({ ok: false, error: '只有主管理可以查看或修改管理员名单' }, 403);
+            return;
+          }
+          const configFile = path.join(ROOT, 'config.json');
+          const tokenList = () => describeAdminTokens(adminTokens);
+          if (req.method === 'GET' && url.pathname === '/api/admins') {
+            sendJson({
+              ok: true,
+              owners: cfg.admins?.owners ?? [],
+              managers: cfg.admins?.managers ?? [],
+              audit: cfg.admins?.audit !== false,
+              tokens: tokenList(),
+              me: { qq: consoleIdentity.qq ?? null, name: consoleIdentity.name ?? '' }
+            });
+            return;
+          }
+          // 改名单：role = owner / manager / none(移除)。只改 admins 段，别的字段原样保留。
+          if (req.method === 'POST' && url.pathname === '/api/admins') {
+            const body = await readBody().catch(() => ({}));
+            const qq = (() => { try { return normalizeOwnerQQ(body.qq); } catch { return null; } })();
+            const role = body.role === 'manager' ? 'manager' : body.role === 'none' ? 'none' : 'owner';
+            if (!qq) { sendJson({ ok: false, error: 'QQ 号无效（必须是正整数）' }, 400); return; }
+            const nextOwners = (cfg.admins?.owners ?? []).map(Number).filter((n) => n !== qq);
+            const nextManagers = (cfg.admins?.managers ?? []).map(Number).filter((n) => n !== qq);
+            if (role === 'owner') nextOwners.push(qq);
+            if (role === 'manager') nextManagers.push(qq);
+            // 安全阀：至少留一个主管理，且不能让当前操作者把自己踢出去（否则控制台就锁死了）。
+            if (!nextOwners.length) { sendJson({ ok: false, error: '至少要保留一个主管理' }, 400); return; }
+            const meQQ = Number(consoleIdentity.qq ?? 0);
+            if (meQQ && !nextOwners.includes(meQQ)) {
+              sendJson({ ok: false, error: '不能把当前登录的主管理移出名单（会把自己锁在门外）' }, 400);
+              return;
+            }
+            const file = readConfigObject(configFile);
+            file.admins = { ...(file.admins ?? {}), owners: nextOwners, managers: nextManagers };
+            atomicWriteJson(configFile, file);
+            cfg.admins = normalizeAdmins(file.admins, normalizeOwnerQQ(file.ownerQQ));
+            adminsMtimeMs = (() => { try { return fs.statSync(configFile).mtimeMs; } catch { return adminsMtimeMs; } })();
+            rebuildAdminIndex();
+            auditAdmin(consoleIdentity.qq ?? 'console', 'owner', `admins:${role}:${qq}`);
+            log(`控制台：管理员名单已更新（${qq} → ${role}），主管理 ${cfg.admins.owners.join(',')}；普通管理 ${cfg.admins.managers.join(',') || '无'}`);
+            sendJson({ ok: true, owners: cfg.admins.owners, managers: cfg.admins.managers });
+            return;
+          }
+          // 签发令牌：一人一令牌，明文只在这里返回一次。
+          if (req.method === 'POST' && url.pathname === '/api/admins/token') {
+            const body = await readBody().catch(() => ({}));
+            const qq = (() => { try { return normalizeOwnerQQ(body.qq); } catch { return null; } })();
+            if (!qq) { sendJson({ ok: false, error: 'QQ 号无效（必须是正整数）' }, 400); return; }
+            if (!(cfg.admins?.owners ?? []).map(Number).includes(qq)) {
+              sendJson({ ok: false, error: '只有主管理才能签发控制台令牌' }, 400);
+              return;
+            }
+            const issued = issueAdminToken(adminTokens, { qq, name: String(body.name ?? '') });
+            saveAdminTokens();
+            auditAdmin(consoleIdentity.qq ?? 'console', 'owner', `token:issue:${qq}`);
+            log(`控制台：已为 ${qq} 签发新令牌（只显示一次，未记录明文）`);
+            sendJson({ ok: true, token: issued.token, qq, note: '明文只显示这一次，请立刻复制到那台机器上；丢了就重新签发。' });
+            return;
+          }
+          // 吊销：按 QQ 吊销该人的全部令牌。
+          // 用 DELETE + JSON body（不是 ?qq=）：/api 的 CSRF 防护要求所有写操作带
+          // application/json，前端 api() 只在有 body 时才加这个头，用 query 会被 415 挡掉。
+          if (req.method === 'DELETE' && url.pathname === '/api/admins/token') {
+            const body = await readBody().catch(() => ({}));
+            const qq = (() => { try { return normalizeOwnerQQ(body.qq ?? url.searchParams.get('qq')); } catch { return null; } })();
+            if (!qq) { sendJson({ ok: false, error: '缺少 qq 参数' }, 400); return; }
+            const removed = revokeAdminTokens(adminTokens, qq);
+            if (removed) saveAdminTokens();
+            auditAdmin(consoleIdentity.qq ?? 'console', 'owner', `token:revoke:${qq}`);
+            sendJson({ ok: true, removed });
+            return;
+          }
+          sendJson({ ok: false, error: '不支持的 /api/admins 操作' }, 404);
           return;
         }
         // ── 控制台访问令牌（可手动修改/生成随机） ─────────────────────────────
@@ -11693,7 +11910,12 @@ async function main() {
     const quoteTargetIsSelf = await isQuoteTargetSelf(event.message ?? [], kind, id, event.self_id);
     if (!isSessionAllowedInCurrentMode(key)) return;
     if (!plainContent && !quoteTargetIsSelf) return;
-    const isOwner = String(event.user_id) === String(cfg.ownerQQ ?? '');
+    // 身份分级：主管理（全部权限）/ 普通管理（只能 pause·resume）/ 普通群友。
+    // isOwner 仍表示"主管理"，因为静默模式、角色切换、审批回答这些语义只属于主管理；
+    // 普通管理在这些地方按普通群友处理（用户要求：普通管理=能用 pause/resume 的群友）。
+    const role = roleOf(event.user_id);
+    const isOwner = role === 'owner';
+    const isAdmin = role !== 'user';
     const roleState = readRoleState();
 
     // 若该会话有挂起的提问/审批，先当作回答处理（用当前消息自己的文字，不含引用原文）。
@@ -11723,9 +11945,12 @@ async function main() {
       return;
     }
 
-    // 管理命令：仅管理员（ownerQQ）可用，且由桥接直接执行（硬性，不经过模型）
+    // 管理命令：由桥接直接执行（硬性，不经过模型）。
+    // 权限分级（2026-10-31）：主管理全量；普通管理只放行 tier=manager 的命令
+    // （/help /pause /resume）；其余对普通管理**静默**，不提示"你没权限"——提示等于告诉
+    // 对方"这台机器人有管理面"，和当年刷屏回"管理命令仅管理员可用"是一个坑。
     if (plainContent.startsWith('/')) {
-      if (!isOwner) {
+      if (!isAdmin) {
         // 默认静默：不回任何提示（其它机器人的 "/" 指令也会走到这里）。
         if (cfg.commands?.rejectNonOwner) {
           await sendToQQ(key, '管理命令仅管理员可用。');
@@ -11735,10 +11960,29 @@ async function main() {
         }
         return;
       }
+      // 普通管理：只认 tier=manager 的命令；未知的 /xxx 也不放行（那条会转发给 DSH）。
+      if (role === 'manager') {
+        const tier = commandTierOf(plainContent);
+        if (tier !== 'manager') {
+          appendActivity(`${key} 普通管理越权命令 ${event.user_id}：${plainContent.slice(0, 40)}`);
+          logThrottled(`普通管理越权命令 ${key}`, 60_000, `忽略普通管理的越权命令（${event.user_id}）：${plainContent.slice(0, 60)}`);
+          auditAdmin(event.user_id, role, plainContent.split(/\s+/)[0].slice(0, 40), 'denied');
+          return;
+        }
+        const gate = adminCommandAllowed(String(event.user_id));
+        if (!gate.ok) {
+          await sendToQQ(key, gate.reason === 'cooldown'
+            ? '操作太频繁，10 秒后再试。'
+            : `最近一小时内操作次数已达上限（${ADMIN_CMD_HOURLY_MAX} 次）。`);
+          auditAdmin(event.user_id, role, plainContent.split(/\s+/)[0].slice(0, 40), `rate-limited:${gate.reason}`);
+          return;
+        }
+      }
       // /help —— 所有管理命令的入口。命令清单一律来自 src/admin-commands.js（数据驱动），
-      // 这里只负责发出去；加命令不需要再改这段。
+      // 这里只负责发出去；加命令不需要再改这段。普通管理只看到自己能用的那几条。
       if (plainContent === '/help' || plainContent === '/?' || plainContent === '/命令') {
-        await sendToQQ(key, renderAdminHelp());
+        await sendToQQ(key, renderAdminHelp({ role }));
+        auditAdmin(event.user_id, role, '/help');
         return;
       }
       // /log [n] —— 远程看日志尾巴（在群里排障用，不必去翻磁盘）。
@@ -11764,22 +12008,35 @@ async function main() {
         const wantPause = plainContent === '/pause';
         if (socialV2.paused === wantPause) {
           await sendToQQ(key, wantPause ? 'AI 已经是暂停状态（/resume 恢复）。' : 'AI 现在是正常状态（/pause 可暂停）。');
+          auditAdmin(event.user_id, role, wantPause ? '/pause' : '/resume', 'noop');
           return;
         }
+        const actorQQ = String(event.user_id);
+        const actorName = String(event.sender?.card || event.sender?.nickname || actorQQ);
         socialV2.paused = wantPause;
         if (wantPause) {
+          // 记录是谁停的：/status、控制台、审计都靠它区分「管理员主动停」和「卡住了」。
+          socialV2.pausedBy = { qq: actorQQ, name: actorName, at: Date.now(), role };
           clearAllSocialV2Timers();
-          log('管理员命令：二代 AI 已暂停（唤醒/等待任务已停止）');
+          log(`管理员命令：二代 AI 已暂停（执行者 ${actorName}/${actorQQ}，角色 ${role}）`);
         } else {
-          log('管理员命令：二代 AI 已恢复');
+          // Q3：任意管理员都能恢复（不限定暂停者），但审计里记下谁恢复的。
+          const stopped = socialV2.pausedBy;
+          socialV2.pausedBy = null;
+          log(`管理员命令：二代 AI 已恢复（执行者 ${actorName}/${actorQQ}，角色 ${role}${stopped ? `；原暂停者 ${stopped.name}/${stopped.qq}` : ''}）`);
           for (const ck of socialV2.conversations.keys()) {
             setupSleepTimerV2(ck);
             scheduleProactiveCheckV2(ck);
           }
         }
         saveSocialV2State();
+        auditAdmin(event.user_id, role, wantPause ? '/pause' : '/resume');
+        // 普通管理暂停时私聊通知所有主管理——被停了得有人知道，否则可能一停一整晚。
+        if (wantPause && role === 'manager') {
+          notifyOwnersOfManagerPause(actorName, actorQQ, key).catch(() => {});
+        }
         await sendToQQ(key, wantPause
-          ? 'AI 已暂停：消息继续入库（恢复后能读未读），但不会主动发言。发 /resume 恢复。'
+          ? `AI 已暂停（${actorName}）。消息继续入库（恢复后能读未读），但不会主动发言。发 /resume 恢复。`
           : 'AI 已恢复：新消息会照常参与。');
         return;
       }
@@ -11860,6 +12117,8 @@ async function main() {
           role: rs.role,
           speakMode: rs.mode,
           paused: socialV2.paused === true,
+          pausedBy: socialV2.pausedBy ?? null,
+          adminRole: role,
           voice: (() => { try { return voiceCfg().enabled; } catch { return false; } })(),
           mcpTools: mcp?.count ?? null,
           logKB

@@ -22,6 +22,11 @@
     "homeDir": ""
   },
   "ownerQQ": null,
+  "admins": {
+    "owners": [],
+    "managers": [],
+    "audit": true
+  },
   "sessionCwd": "",
   "agentPreset": "qq-chat",
   "workspaceTitle": "QQ 聊天",
