@@ -350,6 +350,33 @@ export async function safeFetch(urlString, maxChars = 50000) {
   throw new Error('重定向次数过多，已停止');
 }
 
+/**
+ * 下载任意二进制（群文件、附件），只做 SSRF/体积/重定向约束，不做「必须是图片」的格式检查。
+ *
+ * 为什么不复用 safeFetchBuffer：那是给图片用的，末尾会拒绝非 PNG/JPEG/GIF/WebP 的内容，
+ * 而群文件可能是 docx/pdf/zip。安全检查（协议白名单、私网拦截、逐跳校验、体积上限）完全一样。
+ */
+export async function safeFetchFile(urlString, maxBytes = 32 * 1024 * 1024) {
+  validateLimit(maxBytes, 'maxBytes');
+  const MAX_REDIRECTS = 5;
+  let { url, addresses } = await validateFetchUrl(urlString);
+  for (let i = 0; i <= MAX_REDIRECTS; i++) {
+    const result = await requestOnce(url, addresses, maxBytes, true);
+    if ([301, 302, 303, 307, 308].includes(result.statusCode)) {
+      if (!result.redirect) throw new Error(`重定向缺少 Location: ${result.statusCode}`);
+      const next = new URL(result.redirect, url).toString();
+      ({ url, addresses } = await validateFetchUrl(next));
+      continue;
+    }
+    if (result.statusCode < 200 || result.statusCode >= 300) {
+      throw new Error(`文件下载失败：HTTP ${result.statusCode}`);
+    }
+    if (!result.buffer || !result.buffer.length) throw new Error('下载到的内容为空');
+    return { url: url.toString(), statusCode: result.statusCode, buffer: result.buffer };
+  }
+  throw new Error('重定向次数过多，已停止');
+}
+
 /** 仅接受 DSH 支持的四种图片格式：PNG/JPEG/GIF/WebP。 */
 export function looksLikeImageBuffer(buf) {
   if (!buf || buf.length < 12) return false;

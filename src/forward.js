@@ -45,7 +45,15 @@ function segmentText(seg) {
     case 'image': return '[图片]';
     case 'record': return '[语音]';
     case 'video': return '[视频]';
-    case 'file': return `[文件${d.name ?? ''}]`;
+    case 'file': {
+      // 带上 file_id / busid / size：模型拿到这些才能用 qq_download_file 去取
+      const name = d.file_name ?? d.name ?? '';
+      const extras = [];
+      if (d.file_id) extras.push(`file_id=${d.file_id}`);
+      if (d.busid != null) extras.push(`busid=${d.busid}`);
+      if (d.file_size) extras.push(`size=${d.file_size}`);
+      return `[文件 ${name}${extras.length ? ` ${extras.join(' ')}` : ''}]`;
+    }
     case 'reply': return '[引用]';
     case 'forward': return '[转发]';
     case 'json': return '[卡片消息]';

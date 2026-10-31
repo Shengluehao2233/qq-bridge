@@ -38,6 +38,16 @@
     "rejectNonOwner": false,
     "notifyTurnError": false
   },
+  "files": {
+    "enabled": true,
+    "maxBytes": 33554432,
+    "maxTextChars": 20000,
+    "maxImages": 4,
+    "dir": "state/files",
+    "officeCli": "",
+    "pdftotext": "",
+    "timeoutMs": 120000
+  },
   "ackMessage": "",
   "sendDelayMs": 300,
   "questionTimeoutMs": 300000,

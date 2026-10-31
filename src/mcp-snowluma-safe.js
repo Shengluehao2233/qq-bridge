@@ -1083,6 +1083,90 @@ if (cfg.socialV2?.tools?.getImages !== false) {
   );
 }
 
+// ── 群文件 / 文档读取工具（桥接侧下载解析） ───────────────────────────────
+// 仿真会话没有本地执行能力，docx/pdf/xlsx 只能由桥接抽成文本或页面图片再交回来。
+if (cfg.files?.enabled !== false) {
+  server.tool(
+    'qq_list_group_files',
+    '列出群的共享文件（含子文件夹里的）。当对方说「群文件里有…」「帮我看下群里那个文件」而你不知道 file_id 时，先调这个拿 fileId，再调 qq_download_file。私聊没有文件夹列表，只能直接下载对方发来的文件。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号'),
+      folderId: z.string().optional().describe('子文件夹 id（先不传拿根目录，拿到 folders[].folderId 再传）'),
+      token: z.string().optional().describe('二代会话令牌（reserved2 下必填）')
+    },
+    async ({ key, folderId, token }) => {
+      try {
+        const q = new URLSearchParams({ key });
+        if (folderId) q.set('folderId', folderId);
+        const data = await agentApi(`/api/socialV2/file-list?${q.toString()}`, {
+          headers: token ? { 'x-agent-token': token } : {},
+          timeoutMs: 60000
+        });
+        if (data?.ok === false) return { content: [{ type: 'text', text: `列出群文件失败：${data.error || '未知原因'}` }], isError: true };
+        const files = Array.isArray(data?.files) ? data.files : [];
+        const folders = Array.isArray(data?.folders) ? data.folders : [];
+        const lines = [];
+        if (folders.length) {
+          lines.push(`子文件夹（${folders.length}）：`);
+          for (const f of folders) lines.push(`- ${f.name}  folderId=${f.folderId}  共 ${f.total} 个文件`);
+        }
+        if (files.length) {
+          lines.push(`文件（${files.length}）：`);
+          for (const f of files) lines.push(`- ${f.name}  ${f.sizeText}  fileId=${f.fileId}${f.busid != null ? `  busid=${f.busid}` : ''}`);
+        }
+        if (!files.length && !folders.length) lines.push('这个目录里没有文件。');
+        lines.push('要读某个文件，调 qq_download_file（key + fileId + busid + fileName + size）。');
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `列出群文件失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_download_file',
+    '下载群里/对方发来的文件并读取内容：文本类（txt/md/json/csv/代码）直接给文本；docx/xlsx/pdf 由桥接转换后给文本；扫描件 PDF、幻灯片会渲染成页面图片交给你看。文件超过上限会直接拒绝并告诉你大小，此时如实说明拿不到，不要编造内容。只下载用户明确提到的文件，不要批量乱下载。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      fileId: z.string().describe('文件 id（来自 qq_list_group_files 的 fileId，或消息文本里的 file_id）'),
+      busid: z.union([z.number(), z.string()]).optional().describe('群文件的 busid（来自列表或消息文本，缺了可能取不到下载地址）'),
+      fileName: z.string().optional().describe('原始文件名（含后缀，用于判断类型与落盘命名）'),
+      size: z.number().optional().describe('文件大小（字节，来自列表；超上限能提前拒绝）'),
+      token: z.string().optional().describe('二代会话令牌（reserved2 下必填）')
+    },
+    async ({ key, fileId, busid, fileName, size, token }) => {
+      try {
+        const data = await agentApi('/api/socialV2/file-fetch', {
+          method: 'POST',
+          body: JSON.stringify({ key, fileId: String(fileId), busid, fileName, size }),
+          headers: token ? { 'x-agent-token': token } : {},
+          timeoutMs: 240000
+        });
+        if (data?.ok === false) return { content: [{ type: 'text', text: `读取文件失败：${data.error || '未知原因'}` }], isError: true };
+        const file = data?.file ?? {};
+        const head = `已读取「${file.name || fileName || fileId}」（${file.sizeText || `${file.bytes} B`}，类型 ${file.kind || '未知'}）`;
+        const notes = [];
+        if (data?.truncated) notes.push('（文本过长，已截断，需要更多内容请让我分段读）');
+        if (data?.note) notes.push(`说明：${data.note}`);
+        const text = String(data?.text ?? '').trim();
+        const content = [];
+        const textBody = text
+          ? `${head}\n\n${text}${notes.length ? `\n\n${notes.join('\n')}` : ''}`
+          : `${head}${notes.length ? `\n${notes.join('\n')}` : ''}\n\n（这个文件没有可直接提取的文字，可能需要靠图片理解）`;
+        content.push({ type: 'text', text: textBody });
+        const images = Array.isArray(data?.images) ? data.images : [];
+        for (const img of images) {
+          if (img?.data && img?.mimeType) content.push({ type: 'image', mimeType: img.mimeType, data: img.data });
+        }
+        if (images.length) content.push({ type: 'text', text: `以下 ${images.length} 张是该文件渲染出来的页面，按顺序看。` });
+        return { content };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `读取文件失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
 // ── 表情包体系工具（二代仿真模式） ─────────────────────────────────────────
 if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.listStickers !== false) {
   server.tool(
