@@ -217,8 +217,13 @@ const KNOWN_DANGEROUS_GLOBAL_TOOLS = [
   'dev_uninject_plugin',
 ]
 
+// 去重后才是真正要 restrict 的集合：名单里有 3 个名字同时出现在 OPTIONAL_BUNDLE_TOOL_NAMES
+// （dsh_snapshot / dsh_rollback / incident_resolved），重复 restrict 没有意义，也会让
+// 「调用了几次 / 藏了几个」这类计数对不上。
+const DENY_NAMES = Object.freeze([...new Set(KNOWN_DANGEROUS_GLOBAL_TOOLS)])
+
 // 供 test-preset-local-tools.mjs 导入并与 DSH 真实工具名对账，避免两份名单漂移。
-export const RESTRICTED_TOOL_NAMES = Object.freeze([...KNOWN_DANGEROUS_GLOBAL_TOOLS])
+export const RESTRICTED_TOOL_NAMES = DENY_NAMES
 
 // 执行期白名单：不在这些范围内的工具一律拒绝。
 // 前缀覆盖 DSH MCP client 暴露的命名空间工具。
@@ -272,57 +277,90 @@ function writeDiagnostics(lines) {
 }
 
 export function apply(ctx) {
+  // 注意：**不能**用「全局只跑一次」去重。实测（2026-10-31，DSH 0.2.1-rc.2）
+  // 两个 preset 行各自实例化这个插件，拿到的是**不同的 ctx.tools**，restrict/guard
+  // 也是各自 ctx 上生效的 —— 跳过第二次会让另一个 preset 完全没受保护。
+  // 所以这里每次都注册；日志里出现两行「已隐藏 4 个」是预期行为，不是重复刷屏
+  // （真正让日志爆掉的当年那条 7KB 报错，已在下面改成解析 known-globals 后的短摘要）。
+
   // 1) 把已知危险全局工具从 schema 隐藏（restrict 只影响继承的全局层，
   //    不会误删 preset 自己注册的 scoped 工具）。
-  // 逐个 restrict：当前 DSH 版本不存在的工具名会单独抛错并跳过，
-  // 不会导致整批限制失败（restrict 的 unknown 校验是整批原子性的）。
   //
-  // 口径（2026-09-27 实测 web profile 的全局层）：实际存在的全局工具只有
-  // `dev_*`（注入器）与三个 MCP 命名空间的工具；`read`/`pwsh`/`subagent` 这类
-  // 是**各 preset 行自己注册的 scoped 工具**，在 QQ preset 里根本没挂载，
-  // 因此本名单主要防的是"别的 composition 把它们注册进全局层"这种回归，
-  // 以及 MCP 之外的宿主工具（plugin-guard / cordis 检查工具等）。
+  // 口径（2026-10-31 实测）：DSH 0.2.1-rc.2 的全局层**只有 4 个**工具
+  // （list_mcp_resources / list_mcp_resource_templates / read_mcp_resource /
+  // working_directory）；本名单里其余 80 多个名字是「回归网」——它们要么在别的
+  // composition 里、要么是运行期才注册的 dev_*，当前 DSH 版本根本不存在。
+  //
+  // 旧写法是逐个名字 restrict：85 次调用、81 次抛错，每次抛错都带一份完整的
+  // known-globals 清单（单条 ≈7KB），于是 stderr 里刷出一行 7KB 的报错、还刷两遍。
+  // 现在改成两步：
+  //   ① 先整批 restrict 一次（全存在时最快，1 次调用）；
+  //   ② 失败就**从报错里解析宿主给的 known globals 清单**，与名单求交集后整批再 restrict
+  //      （原子语义下交集必然全部存在）；解析不到才退回逐个尝试。
+  // 这样日志从 7KB 变成一行，也把「哪些名字本该存在却没有」明确记录下来。
   const stamp = new Date().toISOString()
-  const failed = []
-  const attempt = (names) => {
-    let ok = 0
-    for (const name of names) {
-      try {
-        ctx.tools.restrict({ deny: [name] })
-        ok += 1
-      } catch (error) {
-        failed.push({ name, message: String(error?.message ?? error) })
-      }
-    }
-    return ok
+  const knownGlobalsFromError = (message) => {
+    const matched = /known global tools:\s*([\s\S]+)$/i.exec(String(message ?? ''))
+    if (!matched) return null
+    const names = matched[1].split(',').map((s) => s.trim()).filter(Boolean)
+    return names.length ? new Set(names) : null
   }
 
-  const firstOk = attempt(KNOWN_DANGEROUS_GLOBAL_TOOLS)
-  const firstFailed = failed.slice()
-  failed.length = 0
+  let firstOk = 0
+  let absent = [] // 本版本不存在（预期：回归网 / 运行期才注册的 dev_*）
+  let failed = [] // 真的失败（存在却藏不掉）——这才需要人看
+  try {
+    ctx.tools.restrict({ deny: DENY_NAMES })
+    firstOk = DENY_NAMES.length
+  } catch (error) {
+    const known = knownGlobalsFromError(error?.message)
+    if (known) {
+      const present = DENY_NAMES.filter((name) => known.has(name))
+      absent = DENY_NAMES.filter((name) => !known.has(name))
+      try {
+        if (present.length) ctx.tools.restrict({ deny: present })
+        firstOk = present.length
+      } catch (error2) {
+        // 交集都失败说明不是「名字不存在」的问题，退回逐个尝试并如实记录。
+        for (const name of present) {
+          try { ctx.tools.restrict({ deny: [name] }); firstOk += 1 } catch (e) { failed.push(`${name}: ${e?.message ?? e}`) }
+        }
+      }
+    } else {
+      for (const name of DENY_NAMES) {
+        try { ctx.tools.restrict({ deny: [name] }); firstOk += 1 } catch (e) { failed.push(`${name}: ${e?.message ?? e}`) }
+      }
+    }
+  }
 
-  if (firstFailed.length > 0) {
-    // 逐个名字的报错收成一类，避免 18 行重复
-    const reasons = [...new Set(firstFailed.map((f) => f.message))]
-    console.error(
-      `[qq-tool-restrict] restrict 失败 ${firstFailed.length}/${KNOWN_DANGEROUS_GLOBAL_TOOLS.length}：${reasons.join(' | ')}`
-    )
+  console.error(
+    `[qq-tool-restrict] 已隐藏 ${firstOk} 个全局工具；${absent.length} 个名字在本版本不存在（预期，见名单注释）；真正失败 ${failed.length} 个`
+  )
+  // 诊断文件只在**真的失败**时写：`absent` 是常态（名单里绝大多数是回归网名字，
+  // 当前 DSH 版本本来就没有），写进文件只会变成噪声——旧版正是这样把日志刷成 7KB 的。
+  if (failed.length > 0) {
     writeDiagnostics([
-      `${stamp} restrict ok=${firstOk} failed=${firstFailed.length} 原因: ${reasons.join(' | ')}`,
-      `${stamp} 失败样例: ${firstFailed.slice(0, 3).map((f) => f.name).join(', ')}`,
+      `${stamp} restrict ok=${firstOk} absent=${absent.length} failed=${failed.length}`,
+      `${stamp} 失败: ${failed.slice(0, 3).join(' | ').slice(0, 400)}`,
     ])
-    // 时序兜底：注入器的工具可能在 preset apply 之后才注册进全局层。
-    // 3 秒后重试失败项；成功则记一行，失败保留原因。
+  }
+
+  // 时序兜底：两类名字 3 秒后再试一次
+  //   ① dev_*：注入器在 preset apply 之后才注册；
+  //   ② 真正失败的名字：可能是「恰好在这一刻还没注册」，重试比直接放弃更接近事实。
+  const retryNames = [...new Set([
+    ...absent.filter((name) => name.startsWith('dev_')),
+    ...failed.map((entry) => String(entry).split(':')[0].trim()),
+  ])]
+  if (retryNames.length) {
     const timer = setTimeout(() => {
       let ok = 0
       const still = []
-      for (const { name } of firstFailed) {
-        try { ctx.tools.restrict({ deny: [name] }); ok += 1 } catch (error) { still.push(`${name}: ${error?.message ?? error}`) }
+      for (const name of retryNames) {
+        try { ctx.tools.restrict({ deny: [name] }); ok += 1 } catch (error) { still.push(name) }
       }
-      if (ok > 0) console.error(`[qq-tool-restrict] 延迟重试补藏成功 ${ok} 个`)
-      writeDiagnostics([
-        `${new Date().toISOString()} 延迟重试 ok=${ok} 仍失败=${still.length}${still.length ? ` 原因: ${still[0]}` : ''}`,
-      ])
+      if (ok > 0) console.error(`[qq-tool-restrict] 延迟重试补藏 ${ok} 个工具`)
+      writeDiagnostics([`${new Date().toISOString()} 延迟重试 ok=${ok} 仍失败=${still.length}${still.length ? `（${still.slice(0, 5).join(', ')}）` : ''}`])
     }, 3000)
     timer?.unref?.()
   }
