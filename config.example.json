@@ -218,7 +218,9 @@
       "minMs": 5000,
       "maxMs": 600000,
       "defaultQuietMs": 8000,
-      "minQuietAfterNewMs": 10000
+      "minQuietAfterNewMs": 10000,
+      "turnSilenceMs": 90000,
+      "turnMaxMs": 600000
     },
     "sticker": {
       "enabled": true,

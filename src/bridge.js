@@ -2629,6 +2629,11 @@ async function main() {
   const collectors = new Map(); // sessionId -> turn collector
   const sendToolSucceededSessions = new Set(); // sessionId：当前 turn 内 MCP 发送类工具至少成功一次
   const v2TurnStartAt = new Map(); // sessionId -> timestamp：reserved2 turn 开始时间，用于判断是否“无行动”
+  // sessionId -> 最近一次收到**任意**事件帧的时间戳。
+  // 用途见 startTurnWatchdog()：回合还在流式输出（token 增量、工具调用）说明 DSH 没死，
+  // 不该按「卡死」处理；反过来说，90 秒一帧都没有，才是「这个回合已经废了」的强信号。
+  // 只有这个信号能让「卡死」从 15 分钟的兜底缩短到分钟级，而不会误kill慢思考的回合。
+  const turnLastEventAt = new Map();
   const toolCallNames = new Map(); // sessionId -> Map<callId, toolName>：用于结果日志关联工具名
   const pendingSendToolCalls = new Map(); // sessionId -> Set<callId>：等待 tool/result 的发送类调用
   // reserved2 防“忘记设置唤醒条件”：key -> 当前是否等待 AI 处理唤醒回合 / 本回合已更新唤醒配置 / 连续未设置次数
@@ -3015,6 +3020,7 @@ async function main() {
     sendToolSucceededSessions.delete(sessionId);
     pendingSendToolCalls.delete(sessionId);
     v2TurnStartAt.delete(sessionId);
+    turnLastEventAt.delete(sessionId);
     turnLeaseNoted.delete(sessionId);
     toolCallNames.delete(sessionId);
     social.silentTurns.delete(sessionId);
@@ -3203,6 +3209,18 @@ async function main() {
   // isConversationBusyV2 于是永久为真（实测：一个 @ 被「会话繁忙」挡住后再也不会被唤醒）。
   // 这里对超时回合做兜底：清掉回合跟踪并补一次积压唤醒。
   const TURN_STALL_MS = 15 * 60 * 1000;
+  // 事件级卡死判据：回合已经开始，却连续 TURN_SILENCE_MS 一帧都没来。
+  // 「有没有事件」比「跑了多久」可靠得多：慢思考/长工具回合照样在吐帧，而被打断的回合
+  // 是一帧都没有。默认 90s；socialV2.wait.turnSilenceMs=0 可关闭（回到纯超时兜底）。
+  const TURN_SILENCE_MS = (() => {
+    const v = Number(cfg.socialV2?.wait?.turnSilenceMs);
+    return Number.isFinite(v) && v >= 0 ? v : 90_000;
+  })();
+  // 硬上限：即使一直在吐帧，总时长超过它也要收尾，防「永远不结束」的回合占着会话。
+  const TURN_MAX_MS = (() => {
+    const v = Number(cfg.socialV2?.wait?.turnMaxMs);
+    return Number.isFinite(v) && v >= 0 ? v : 10 * 60 * 1000;
+  })();
   // prompt 投出后多久还没等到 turn/start 就认为 DSH 没接住（刚重启、MCP 还在注册时不接单）。
   const PROMPT_PICKUP_MS = 2 * 60 * 1000;
   // 清掉一个会话的卡死回合后，把积压的第一条唤醒原因重新排上（其余留在队列里等下一轮）。
@@ -3225,6 +3243,7 @@ async function main() {
         log(`[reserved2] ⚠️ 会话 ${key} 的回合已持续 ${Math.round((now - startedAt) / 60000)} 分钟仍未结束，按卡死处理：清理回合跟踪并补发积压唤醒`);
         appendActivity(`${key} [reserved2] 回合超时 ${Math.round((now - startedAt) / 60000)} 分钟，已强制清理（可能是 DSH 重启打断了工具调用）`);
         v2TurnStartAt.delete(sid);
+        turnLastEventAt.delete(sid);
         collectors.delete(sid);
         pendingWakeKeys.delete(key);
         disarmPendingWakeLease(key);
@@ -3241,21 +3260,31 @@ async function main() {
         if (!startedAt) continue;
         if (promptQueues.get(key) !== entry) continue;
         const sid = state.sessions[key];
-        // 两种卡死，判据不同：
-        //  A) 回合已经开始（收到过 turn/start）却迟迟不结束 —— DSH 重启打断工具调用的典型样子，
-        //     回合可能很长，给足 TURN_STALL_MS。
-        //  B) prompt 投出去了，但连 turn/start 都没等到 —— DSH 刚重启、MCP 还没注册完时不接单，
+        // 三种卡死，判据不同：
+        //  A) 回合已经开始（收到过 turn/start），而且**还在吐事件** —— 大概率是长回合，给足 TURN_STALL_MS。
+        //  B) 回合已经开始，但已经 TURN_SILENCE_MS 一帧都没有 —— DSH 那边早死了（重启打断工具调用、
+        //     MCP 子进程被杀）。以前这种情况要白等 15 分钟，群里就是「卡住不动」。
+        //  C) prompt 投出去了，但连 turn/start 都没等到 —— DSH 刚重启、MCP 还没注册完时不接单，
         //     实测就是这样把整个群卡哑的。这种情况 2 分钟就能判定，越早重试越好。
         const turnSeen = !!(sid && (v2TurnStartAt.has(sid) || collectors.has(sid)));
-        const limit = turnSeen ? TURN_STALL_MS : PROMPT_PICKUP_MS;
-        if (now - startedAt < limit) continue;
+        const lastActivity = sid ? (turnLastEventAt.get(sid) ?? v2TurnStartAt.get(sid) ?? startedAt) : startedAt;
+        const silentFor = Math.max(0, now - lastActivity);
+        const silentTimeout = turnSeen && TURN_SILENCE_MS > 0 && silentFor >= TURN_SILENCE_MS;
+        const hardTimeout = now - startedAt >= (turnSeen ? TURN_MAX_MS : PROMPT_PICKUP_MS);
+        if (!silentTimeout && !hardTimeout) continue;
         const mins = Math.max(1, Math.round((now - startedAt) / 60000));
-        log(turnSeen
-          ? `[reserved2] ⚠️ 会话 ${key} 的 prompt 已投出 ${mins} 分钟且回合迟迟不结束，按卡死处理：丢弃队列并补发积压唤醒`
-          : `[reserved2] ⚠️ 会话 ${key} 的 prompt 投出 ${mins} 分钟仍未等到 turn/start（DSH 没接住），重置后重试`);
-        appendActivity(turnSeen
-          ? `${key} [reserved2] prompt 投递超时 ${mins} 分钟，已强制清理`
-          : `${key} [reserved2] prompt 未被 DSH 接单 ${mins} 分钟，已重置重试`);
+        const silentSecs = Math.round(silentFor / 1000);
+        if (silentTimeout && !hardTimeout) {
+          log(`[reserved2] ⚠️ 会话 ${key} 的回合已 ${silentSecs} 秒没有任何事件（已进行 ${mins} 分钟），判定卡死：清理回合跟踪并补发积压唤醒`);
+          appendActivity(`${key} [reserved2] 回合静默 ${silentSecs} 秒，判定卡死并清理`);
+        } else {
+          log(turnSeen
+            ? `[reserved2] ⚠️ 会话 ${key} 的 prompt 已投出 ${mins} 分钟且回合迟迟不结束，按卡死处理：丢弃队列并补发积压唤醒`
+            : `[reserved2] ⚠️ 会话 ${key} 的 prompt 投出 ${mins} 分钟仍未等到 turn/start（DSH 没接住），重置后重试`);
+          appendActivity(turnSeen
+            ? `${key} [reserved2] prompt 投递超时 ${mins} 分钟，已强制清理`
+            : `${key} [reserved2] prompt 未被 DSH 接单 ${mins} 分钟，已重置重试`);
+        }
         // 作废本 entry：先 +1 epoch，在途 await 的 finally 会因引用/epoch 不匹配而不再续跑队列。
         promptQueueEpoch.set(key, (promptQueueEpoch.get(key) ?? 0) + 1);
         const dropped = entry.queue.splice(0);
@@ -3267,6 +3296,7 @@ async function main() {
         promptQueues.delete(key);
         if (sid) {
           v2TurnStartAt.delete(sid);
+          turnLastEventAt.delete(sid);
           collectors.delete(sid);
           sendToolSucceededSessions.delete(sid);
           pendingSendToolCalls.delete(sid);
@@ -3276,7 +3306,8 @@ async function main() {
         replayPendingWake(key);
       }
     };
-    const timer = setInterval(tick, 60_000);
+    // 有事件级判据时扫得更勤：90s 阈值配 60s 轮询最坏要 150s 才反应，15s 轮询把误差压到 ~105s。
+    const timer = setInterval(tick, TURN_SILENCE_MS > 0 ? 15_000 : 60_000);
     timer.unref?.();
   }
 
@@ -4943,6 +4974,7 @@ async function main() {
               reverse.delete(sid);
               collectors.delete(sid);
               v2TurnStartAt.delete(sid);
+              turnLastEventAt.delete(sid);
               turnLeaseNoted.delete(sid);
               toolCallNames.delete(sid);
               pendingSendToolCalls.delete(sid);
@@ -7533,6 +7565,7 @@ async function main() {
           sendToolSucceededSessions.delete(oldSessionId);
           pendingSendToolCalls.delete(oldSessionId);
           v2TurnStartAt.delete(oldSessionId);
+          turnLastEventAt.delete(oldSessionId);
           turnLeaseNoted.delete(oldSessionId);
           toolCallNames.delete(oldSessionId);
           const pe = pending.get(key);
@@ -11575,6 +11608,7 @@ async function main() {
           sendToolSucceededSessions.delete(old);
           pendingSendToolCalls.delete(old);
           v2TurnStartAt.delete(old);
+          turnLastEventAt.delete(old);
           turnLeaseNoted.delete(old);
           toolCallNames.delete(old);
           social.silentTurns.delete(old);
@@ -12195,6 +12229,7 @@ async function main() {
     } else if (event?.type === 'turn/end' && (!collector || collector.size?.() === 0)) {
       collectors.delete(sessionId);
       v2TurnStartAt.delete(sessionId);
+      turnLastEventAt.delete(sessionId);
       turnLeaseNoted.delete(sessionId);
     }
     return { collector, ended };
@@ -12212,6 +12247,9 @@ async function main() {
         for await (const envelope of api.events.mux({})) {
           framesThisStream += 1;
           const frame = envelope.payload;
+          // 事件级活性戳（越早越好，连快照也算）：看门狗据此判断「这个回合还在动」。
+          // 放到所有分支之前，是因为任何类型的帧都证明 DSH 还在往这边推东西。
+          if (frame?.sessionId) turnLastEventAt.set(frame.sessionId, Date.now());
           // 会话开场快照：只喂 token 账本。它含**历史** turn/end，绝不能让它们走
           // session/event 通道 —— 否则桥接会把早已结束的回合当成新回合去发 QQ 回复。
           if (frame.type === 'session/snapshot') {
@@ -12346,6 +12384,7 @@ async function main() {
                 }
               }
               v2TurnStartAt.delete(frame.sessionId);
+              turnLastEventAt.delete(frame.sessionId);
               collectors.delete(frame.sessionId);
               turnLeaseNoted.delete(frame.sessionId);
               const sendToolSucceeded = sendToolSucceededSessions.has(frame.sessionId);

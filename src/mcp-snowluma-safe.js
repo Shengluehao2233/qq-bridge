@@ -294,6 +294,14 @@ async function legacyReadToolAllowed() {
 }
 
 const server = new McpServer({ name: 'snowluma-safe', version: '0.2.1-r1' });
+// 记录本进程注册过的工具名（供 state/mcp-tools.json 快照与健康检查比对）。
+// SDK 的 _registeredTools 是内部字段、随时可能改名，所以自己记一份更稳。
+const registeredToolNames = [];
+const originalServerTool = server.tool.bind(server);
+server.tool = (...args) => {
+  if (typeof args[0] === 'string') registeredToolNames.push(args[0]);
+  return originalServerTool(...args);
+};
 
 // ── 工具开关必须在**注册期**生效，而不是只在校验期 ──────────────────────────
 //
@@ -1520,6 +1528,24 @@ if (cfg.socialV2?.tools?.getForwardMsg !== false) {
       }
     }
   );
+}
+
+// 工具表快照：把本次进程注册的工具名写进 state/mcp-tools.json。
+//
+// 为什么需要它：MCP server 是 DSH **启动时**拉起的，桥接代码更新后如果只重启桥接，
+// 模型看到的仍是旧工具表 —— 表现是「明明加了工具，模型说没有」。健康检查
+// （scripts/health-check.mjs）拿这个文件的时间和 DSH 进程启动时间比一下，
+// 就能把「工具表是旧的」从猜测变成一条确定的红灯。
+try {
+  fs.mkdirSync(path.join(ROOT, 'state'), { recursive: true });
+  fs.writeFileSync(path.join(ROOT, 'state', 'mcp-tools.json'), `${JSON.stringify({
+    startedAt: new Date().toISOString(),
+    pid: process.pid,
+    count: registeredToolNames.length,
+    tools: [...registeredToolNames].sort()
+  }, null, 2)}\n`, 'utf8');
+} catch (error) {
+  console.error(`[mcp-snowluma-safe] 写工具表快照失败：${error?.message ?? error}`);
 }
 
 await server.connect(new StdioServerTransport());
