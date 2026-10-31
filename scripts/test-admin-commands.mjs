@@ -12,7 +12,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { ADMIN_COMMANDS, knownCommandNames, renderAdminHelp, renderStatus, tailLines } from '../src/admin-commands.js';
+import { ADMIN_COMMANDS, knownCommandNames, renderAdminHelp, renderStatus, tailLines, commandTierOf, normalizeAdmins, normalizeOwnerQQ } from '../src/admin-commands.js';
 
 let pass = 0;
 const failures = [];
@@ -98,6 +98,53 @@ const tailDefault = tailLines(logFile, 0);
 ok(tailDefault.lines.length === 30, '行数非法（0）时退回默认 30 行');
 
 fs.rmSync(tmpDir, { recursive: true, force: true });
+
+// ── 5. 权限分级（2026-10-31）────────────────────────────────────────────────
+section('5. 权限分级');
+ok(ADMIN_COMMANDS.every((c) => c.tier === 'owner' || c.tier === 'manager'), '每条命令都有合法 tier');
+const managerCmds = ADMIN_COMMANDS.filter((c) => c.tier === 'manager').map((c) => c.cmd).sort();
+ok(JSON.stringify(managerCmds) === JSON.stringify(['/help', '/pause', '/resume']), `普通管理只放行这三条（实际 ${managerCmds.join(' ')}）`);
+
+ok(commandTierOf('/pause') === 'manager' && commandTierOf('/resume') === 'manager', 'commandTierOf 认出 /pause /resume');
+ok(commandTierOf('/pause  ')/* 尾随空格 */ === 'manager', 'commandTierOf 容忍尾随空格');
+ok(commandTierOf('/status') === 'owner', 'commandTierOf(/status) = owner');
+ok(commandTierOf('/nonexistent') === null, '未知命令返回 null（普通管理静默的关键）');
+ok(commandTierOf('') === null && commandTierOf(null) === null, '空输入不抛错');
+ok(commandTierOf('随便聊聊') === null, '不以 / 开头的内容不算命令');
+
+const managerHelp = renderAdminHelp({ role: 'manager' });
+ok(/普通管理/.test(managerHelp), 'manager 版帮助有身份提示');
+ok(/\/pause/.test(managerHelp) && /\/resume/.test(managerHelp), 'manager 版帮助包含 pause/resume');
+ok(!/\/status/.test(managerHelp) && !/\/log/.test(managerHelp), 'manager 版帮助不泄露主管理命令');
+const ownerHelp = renderAdminHelp({ role: 'owner' });
+ok(/\/status/.test(ownerHelp) && /\/log/.test(ownerHelp), 'owner 版帮助包含全部命令');
+ok(renderAdminHelp().split('\n').length === ownerHelp.split('\n').length, '不传 role 时等价于 owner（向后兼容旧调用）');
+
+const norm1 = normalizeAdmins({}, 3149641864);
+ok(JSON.stringify(norm1.owners) === '[3149641864]' && norm1.managers.length === 0, 'admins 为空时回落到 ownerQQ');
+ok(norm1.audit === true, '默认开启审计');
+
+const norm2 = normalizeAdmins({ owners: [1, 1, 'x', 2], managers: [2, 3], audit: false }, null);
+ok(JSON.stringify(norm2.owners) === '[1,2]', 'owners 去重且丢弃非法项');
+ok(JSON.stringify(norm2.managers) === '[3]', '同一 QQ 两边都有时按 owners 算（不重复进 managers）');
+ok(norm2.audit === false, 'audit:false 生效');
+
+const norm3 = normalizeAdmins({ owners: [], managers: [5] }, 7);
+ok(JSON.stringify(norm3.owners) === '[7]', 'owners 显式为空数组时也回落到 ownerQQ');
+const norm4 = normalizeAdmins({ owners: ['', null, 'abc', -1, 0] }, null);
+ok(norm4.owners.length === 0, '全是脏数据时不崩、返回空名单（fail-closed 由调用方决定）');
+
+ok(normalizeOwnerQQ(' 3149641864 ') === 3149641864, 'normalizeOwnerQQ 容忍空格');
+ok(normalizeOwnerQQ(null) === null && normalizeOwnerQQ('') === null, '空值返回 null');
+let threw = false;
+try { normalizeOwnerQQ('abc'); } catch { threw = true; }
+ok(threw, '非法 ownerQQ 抛错（配置写错要立刻暴露）');
+
+const statusWithTier = renderStatus({ version: '1.0', mode: 'reserved2', dshReady: true, paused: true, pausedBy: { qq: 1, name: '小明' }, adminRole: 'owner' });
+ok(/小明\/1/.test(statusWithTier), 'pausedBy 是对象时显示「名字/QQ」而不是 [object Object]');
+ok(/你的身份 主管理/.test(statusWithTier), 'status 显示调用者身份');
+const statusLegacy = renderStatus({ paused: true, pausedBy: '旧字符串' });
+ok(/旧字符串/.test(statusLegacy), '兼容旧版 pausedBy 字符串');
 
 // ── 汇总 ───────────────────────────────────────────────────────────────────
 console.log(`\n${failures.length === 0 ? '🎉 全部通过' : '❌ 有失败'}：${pass} 通过 / ${failures.length} 失败`);
