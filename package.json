@@ -62,6 +62,8 @@
     "diagnose:acl": "node scripts/diagnose-acl.mjs",
     "harden-acl": "node scripts/harden-state-acl.mjs",
     "test-video": "node scripts/test-video.mjs",
+    "test:docs": "node scripts/test-docs.mjs",
+    "test:docs:live": "node scripts/test-docs.mjs --live",
     "test-video:live": "node scripts/test-video.mjs --live"
   },
   "dependencies": {

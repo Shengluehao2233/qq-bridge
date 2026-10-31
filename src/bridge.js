@@ -21,13 +21,15 @@ import { mdToPlain, splitForQQ, truncateText, truncateTextTail } from './md-to-p
 import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage, describeAge } from './qq-model-view.js';
-import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
+import { safeFetchBuffer, safeFetchFile, looksLikeImageBuffer } from './safe-fetch.js';
 import { normalizeImageForModel } from './media-normalize.js';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
 import { resolvePriceTable } from './model-prices.js';
+// 文档抽取（群文件/群友发来的文档）：QQ 侧仿真会话没有本地执行能力，文档只能在桥接进程里解析。
+import { extractDocument, sanitizeFileName, docKindOf } from './qq-docs.js';
 // TTS（文字转语音）：合成逻辑全在 src/tts/，桥接只负责「谁在什么时候让谁说」。
 import { synthesize as ttsSynthesize, prepareText as ttsPrepareText, normalizeLocale as ttsNormalizeLocale, resolveVoice as ttsResolveVoice, listVoices as ttsListVoices, LOCALE_VOICES, TtsError } from './tts/index.js';
 import { createTokenLedger } from './token-ledger.js';
@@ -796,6 +798,27 @@ function loadConfig() {
       interceptNotify: true,
       ...(file.security ?? {})
     },
+    // 群文件 / 群友发来的文档：按需下载 + 桥接侧抽取。
+    // 为什么是「按需」而不是自动下载：QQ 群的文件夹可能很大，自动拉全部文件既费流量
+    // 也会把不可信内容灌进模型上下文；模型只在真的要看某个文件时才调 qq_download_file。
+    files: {
+      enabled: true,
+      // 单文件体积上限：超了直接拒绝，不落盘（防 2GB 的 iso 把磁盘塞满）
+      maxBytes: Number(file.files?.maxBytes) > 0 ? Number(file.files.maxBytes) : 32 * 1024 * 1024,
+      // 交给模型的文本上限（超了截断并标注）
+      maxTextChars: Number(file.files?.maxTextChars) > 0 ? Number(file.files.maxTextChars) : 20000,
+      // 扫描件 PDF / 幻灯片渲染成图片时最多给几页
+      maxImages: Number(file.files?.maxImages) > 0 ? Number(file.files.maxImages) : 4,
+      // 落盘目录（相对仓库根）
+      dir: file.files?.dir ?? path.join('state', 'files'),
+      // LibreOffice Kit 的 dsoffice CLI（office 技能用的是同一个引擎）
+      officeCli: file.files?.officeCli ?? '',
+      // pdftotext 可执行文件；留空表示用 PATH 里的
+      pdftotext: file.files?.pdftotext ?? '',
+      // 单个子进程超时
+      timeoutMs: Number(file.files?.timeoutMs) > 0 ? Number(file.files.timeoutMs) : 90000,
+      ...(file.files ?? {})
+    },
     slang: {
       enabled: true,
       extractMinMessages: 10,
@@ -1363,7 +1386,18 @@ async function segmentsToText(segments, options = {}) {
       case 'image': out.push('[图片]'); break;
       case 'record': out.push('[语音]'); break;
       case 'video': out.push('[视频]'); break;
-      case 'file': out.push(`[文件${d.name ?? ''}]`); break;
+      case 'file': {
+        // 文件**不下载**，只把「能拿来取件」的标识交给模型：file_id 是 OneBot 侧的取件句柄，
+        // 没有它模型只能干瞪眼（旧行为是只 push 一个文件名，等于告诉 AI 有个文件但永远读不到）。
+        const fname = d.file_name ?? d.name ?? d.file ?? '';
+        const bits = [`[文件 ${fname}`];
+        if (d.file_id) bits.push(`file_id=${d.file_id}`);
+        if (d.busid) bits.push(`busid=${d.busid}`);
+        const fsize = Number(d.file_size ?? 0);
+        if (fsize > 0) bits.push(`size=${formatBytes(fsize)}`);
+        out.push(`${bits.join(' ')}]`);
+        break;
+      }
       case 'reply': {
         // 引用/回复段：默认解析成「被引用人 + 原文」，让 AI 能判断这句话是对谁说的；
         // includeReply=false 时跳过该段，得到“当前消息自己的文字”（用于指令/指向性判断）。
@@ -5814,6 +5848,114 @@ async function main() {
             sendJson({ ok: true, key, image: { mimeType, data: buf.toString('base64') } });
           } catch (error) {
             sendJson({ ok: false, error: `读取 AI 形象图片失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
+        // ── 群文件 / 文档（按需下载 + 桥接侧抽取） ──────────────────────
+        // QQ 侧的仿真会话没有本地执行能力（铁律 L7：read/bash/python 全被隐藏），
+        // 所以「读文档」只能由桥接来做：这里负责下载、落盘、把 docx/pdf/xlsx 等
+        // 抽成文本或页面图片，再通过 MCP 工具结果交回模型。
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/file-list') {
+          if (cfg.files?.enabled === false) { sendJson({ ok: false, error: '群文件功能已关闭（files.enabled=false）' }, 403); return; }
+          const listKey = String(url.searchParams.get('key') ?? '').trim();
+          const folderId = String(url.searchParams.get('folderId') ?? '').trim();
+          if (!listKey) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(listKey, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2SessionAllowed(listKey)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('listGroupFiles')) { sendJson({ ok: false, error: '工具未启用：qq_list_group_files' }, 403); return; }
+          const listGroupId = listKey.startsWith('group:') ? listKey.slice('group:'.length) : '';
+          if (!listGroupId) { sendJson({ ok: false, error: '只能列出群文件（私聊没有文件夹列表）' }, 400); return; }
+          try {
+            const params = { group_id: Number(listGroupId) };
+            const action = folderId ? 'get_group_files_by_folder' : 'get_group_root_files';
+            if (folderId) params.folder_id = folderId;
+            const data = await onebotCall(action, params);
+            const files = (Array.isArray(data?.files) ? data.files : []).slice(0, 100).map((f) => ({
+              fileId: String(f.file_id ?? ''),
+              name: String(f.file_name ?? ''),
+              size: Number(f.file_size ?? 0),
+              sizeText: formatBytes(Number(f.file_size ?? 0)),
+              busid: f.busid ?? null,
+              uploadTime: f.upload_time ?? null,
+              deadTime: f.dead_time ?? null
+            }));
+            const folders = (Array.isArray(data?.folders) ? data.folders : []).slice(0, 100).map((f) => ({
+              folderId: String(f.folder_id ?? ''),
+              name: String(f.folder_name ?? ''),
+              total: Number(f.total_file_count ?? 0)
+            }));
+            sendJson({ ok: true, key: listKey, groupId: listGroupId, folderId: folderId || null, folders, files });
+          } catch (error) {
+            sendJson({ ok: false, error: `列出群文件失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/file-fetch') {
+          if (cfg.files?.enabled === false) { sendJson({ ok: false, error: '群文件功能已关闭（files.enabled=false）' }, 403); return; }
+          const body = await readBody();
+          const fetchKey = String(body.key ?? '').trim();
+          const fileId = String(body.fileId ?? '').trim();
+          if (!fetchKey || !fileId) { sendJson({ ok: false, error: 'key 和 fileId 不能为空' }, 400); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(fetchKey, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2SessionAllowed(fetchKey)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('downloadFile')) { sendJson({ ok: false, error: '工具未启用：qq_download_file' }, 403); return; }
+          const maxBytes = Number(cfg.files?.maxBytes) > 0 ? Number(cfg.files.maxBytes) : 32 * 1024 * 1024;
+          const declared = Number(body.size ?? 0);
+          if (declared > maxBytes) { sendJson({ ok: false, error: `文件太大（${formatBytes(declared)}），超过上限 ${formatBytes(maxBytes)}` }, 413); return; }
+          const fetchGroupId = fetchKey.startsWith('group:') ? fetchKey.slice('group:'.length) : '';
+          const fetchUserId = fetchKey.startsWith('private:') ? fetchKey.slice('private:'.length) : '';
+          if (!fetchGroupId && !fetchUserId) { sendJson({ ok: false, error: 'key 必须是 group:群号 或 private:QQ号' }, 400); return; }
+          try {
+            const params = fetchGroupId
+              ? { group_id: Number(fetchGroupId), file_id: fileId }
+              : { user_id: Number(fetchUserId), file_id: fileId };
+            if (fetchGroupId && body.busid !== undefined && body.busid !== null && body.busid !== '') params.busid = Number(body.busid);
+            const info = await onebotCall(fetchGroupId ? 'get_group_file_url' : 'get_private_file_url', params);
+            const fileUrl = String(info?.url ?? info?.data?.url ?? '');
+            if (!fileUrl) throw new Error('SnowLuma 没有返回下载地址（文件可能已过期）');
+            const fetched = await safeFetchFile(fileUrl, maxBytes);
+            const buffer = fetched.buffer;
+            if (!buffer || !buffer.length) throw new Error('下载到的内容为空');
+            if (buffer.length > maxBytes) throw new Error(`文件超过上限 ${formatBytes(maxBytes)}，已丢弃`);
+            const baseName = sanitizeFileName(String(body.fileName ?? '') || 'file');
+            const day = new Date().toISOString().slice(0, 10);
+            const dir = path.join(ROOT, String(cfg.files?.dir ?? path.join('state', 'files')), day);
+            fs.mkdirSync(dir, { recursive: true });
+            const ext = path.extname(baseName);
+            const stem = path.basename(baseName, ext);
+            let target = path.join(dir, baseName);
+            for (let i = 1; fs.existsSync(target); i += 1) target = path.join(dir, `${stem}-${i}${ext}`);
+            fs.writeFileSync(target, buffer);
+            const doc = await extractDocument({
+              filePath: target,
+              fileName: baseName,
+              limits: {
+                maxTextChars: cfg.files?.maxTextChars,
+                maxImages: cfg.files?.maxImages,
+                officeCli: cfg.files?.officeCli ?? '',
+                pdftotext: cfg.files?.pdftotext ?? '',
+                timeoutMs: cfg.files?.timeoutMs
+              }
+            });
+            log(`${fetchKey} [file] 已取回 ${baseName}（${formatBytes(buffer.length)}，类型 ${doc.kind}${doc.text ? `，文本 ${doc.text.length} 字` : ''}${doc.images?.length ? `，图片 ${doc.images.length} 张` : ''}）`);
+            sendJson({
+              ok: true,
+              key: fetchKey,
+              file: {
+                name: baseName,
+                bytes: buffer.length,
+                sizeText: formatBytes(buffer.length),
+                kind: doc.kind,
+                path: target
+              },
+              text: doc.text ?? '',
+              truncated: doc.truncated === true,
+              note: doc.note ?? '',
+              images: Array.isArray(doc.images) ? doc.images : []
+            });
+          } catch (error) {
+            log(`${fetchKey} [file] 取回失败：`, error?.message ?? error);
+            sendJson({ ok: false, error: `取回文件失败：${error?.message ?? error}` }, 500);
           }
           return;
         }
