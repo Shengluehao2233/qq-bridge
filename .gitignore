@@ -66,3 +66,6 @@ docs/guides/VOICE.md
 # 语音库（用户个人音频素材，config.json 的 socialV2.voice.dir 指向此处）
 audio/
 
+
+# 用本人聊天记录生成的个人角色卡（内容属于个人隐私，本地保留、不入库）
+/roles/Self.md
