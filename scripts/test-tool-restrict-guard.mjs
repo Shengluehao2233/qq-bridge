@@ -167,6 +167,22 @@ await test('执行期 guard 照旧：QQ MCP 放行、dev_* 与本地工具拒绝
   assert.match(String(guard({})), /工具名无效/);
 });
 
+await test('记忆插件：六个读写工具放行，改目录与后台反思两个仍拒绝', async () => {
+  const diag = path.join(tmpDir, 'diag-memory.log');
+  const mod = await loadPlugin(diag);
+  const { ctx, calls } = makeCtx();
+  mod.apply(ctx);
+  const guard = calls.guard;
+  for (const name of ['memory_search', 'memory_remember', 'memory_read', 'memory_update', 'memory_find_similar', 'memory_project']) {
+    assert.equal(guard({ name }), undefined, `${name} 应放行`);
+  }
+  for (const name of ['memory_home', 'memory_dream']) {
+    assert.match(String(guard({ name })), /不在 QQ 桥接白名单内/, `${name} 必须拒绝`);
+  }
+  // 防止以后有人图省事写成 memory_ 前缀全放行
+  assert.match(String(guard({ name: 'memory_future_tool' })), /不在 QQ 桥接白名单内/);
+});
+
 fs.rmSync(tmpDir, { recursive: true, force: true });
 console.log(`\n${failures ? 'FAILED' : 'ALL PASS'}  tests=${tests} failures=${failures}`);
 if (failures) process.exit(1);

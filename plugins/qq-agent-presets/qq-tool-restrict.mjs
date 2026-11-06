@@ -249,9 +249,20 @@ const SAFE_PREFIXES = [
 
 // 无害模型侧工具：ask_user_question 用于把问题转给管理员/用户，
 // todo_write 仅维护任务列表。若后续 preset 不再挂载这些工具，保留无害。
+//
+// meow-memory（记忆插件）的六个读写工具：QQ 群里要让机器人记住人和事，
+// 就必须放行这几个。故意**不放行**的两个：
+//   memory_home —— 会改实例级数据目录（跨 profile 的全局副作用）；
+//   memory_dream —— 会另起一轮后台反思，等于让群友间接烧模型调用。
 const SAFE_EXACT = new Set([
   'ask_user_question',
   'todo_write',
+  'memory_search',
+  'memory_remember',
+  'memory_read',
+  'memory_update',
+  'memory_find_similar',
+  'memory_project',
 ])
 
 // ── 诊断落盘：restrict 失败时到底为什么 ────────────────────────────────────
