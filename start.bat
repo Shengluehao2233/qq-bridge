@@ -41,7 +41,7 @@ set /a fails=0
 set "hinted="
 
 :loop
-node src/bridge.js
+node "%~dp0src\bridge.js"
 set "code=%errorlevel%"
 if "%code%"=="2" (
     echo [%date% %time%] bridge already running in another window. Exiting.

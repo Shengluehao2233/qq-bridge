@@ -25,6 +25,13 @@ import * as presetPrompt from '../src/preset-prompt.js';
 import * as roleCard from '../src/role-card.js';
 import * as stateAcl from '../src/state-acl.mjs';
 import * as videoDigest from '../src/video-digest.js';
+// 管理员命令表 / 分级归一化在 src/admin-commands.js（0.2.1-r2 合并后 bridge.js 从这里 import，
+// VM 里必须同样注入，否则 loadConfig 一调 normalizeOwnerQQ 就 ReferenceError）。
+import * as adminCommands from '../src/admin-commands.js';
+import * as adminTokens from '../src/admin-tokens.js';
+import * as qqDocs from '../src/qq-docs.js';
+import * as mediaCache from '../src/media-cache.js';
+import * as tts from '../src/tts/index.js';
 import { persistSnowLumaEndpoint, persistToken } from '../src/snowluma-conn.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
@@ -213,6 +220,26 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     resolveInstalledPreset, synchronizePreset, renderPatch, persistSnowLumaEndpoint, persistToken,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
     ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt, ...videoDigest, ...roleCard,
+    ...adminCommands,
+    ...adminTokens,
+    // 只注入 bridge.js 真正 import 的名字：qq-docs 也导出 truncateText（返回 {text,truncated}），
+    // 整体展开会把 md-to-plain 的 truncateText 覆盖掉，消息入库就存成 "[object Object]"。
+    extractDocument: qqDocs.extractDocument,
+    sanitizeFileName: qqDocs.sanitizeFileName,
+    docKindOf: qqDocs.docKindOf,
+    createMediaCache: mediaCache.createMediaCache,
+    cacheKey: mediaCache.cacheKey,
+    settingsFingerprint: mediaCache.settingsFingerprint,
+    // tts 的导出名和桥接里的同名局部量不冲突，但别名前缀保留可读性。
+    synthesize: tts.synthesize,
+    prepareText: tts.prepareText,
+    normalizeLocale: tts.normalizeLocale,
+    resolveVoice: tts.resolveVoice,
+    listVoices: tts.listVoices,
+    LOCALE_VOICES: tts.LOCALE_VOICES,
+    TtsError: tts.TtsError,
+    // bridge.js 里 `tailLines as readTailLines` 的别名在 VM 里也得还原。
+    readTailLines: adminCommands.tailLines,
     // 桥接的出图出口会调归一化（体积/动图抽帧）：VM 里必须能拿到这几个函数。
     normalizeImageForModel: mediaNormalize.normalizeImageForModel,
     sniffImage: mediaNormalize.sniffImage,
