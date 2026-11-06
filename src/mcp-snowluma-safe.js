@@ -329,7 +329,7 @@ async function legacyReadToolAllowed() {
   return String(status?.mode ?? '') === 'closed-agent';
 }
 
-const server = new McpServer({ name: 'snowluma-safe', version: '0.2.1-r1' });
+const server = new McpServer({ name: 'snowluma-safe', version: '0.2.1-r2' });
 // 记录本进程注册过的工具名（供 state/mcp-tools.json 快照与健康检查比对）。
 // SDK 的 _registeredTools 是内部字段、随时可能改名，所以自己记一份更稳。
 const registeredToolNames = [];
@@ -480,7 +480,12 @@ function normalizeWakeArguments(config) {
       return handler(canonicalArgs, ...tail);
     };
     // 旧 tool(rawShape) 的默认策略是 strip；改用公开注册接口保留 strict，未知键明确失败。
-    return registerTool(name, { description: rest[0], inputSchema: z.object(shape).strict() }, guarded);
+    // 注意：这个包装**替换了**上面 337 行那个只记账的 server.tool，所以在真正注册成功
+    // 之后要自己把名字记进 registeredToolNames —— 否则 state/mcp-tools.json 永远是
+    // 0 个工具（0.2.1-r2 合并后踩过：健康检查一直报「工具表 0 个」）。
+    const created = registerTool(name, { description: rest[0], inputSchema: z.object(shape).strict() }, guarded);
+    if (created !== undefined) registeredToolNames.push(name);
+    return created;
   };
 }
 

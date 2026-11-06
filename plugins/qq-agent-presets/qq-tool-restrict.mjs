@@ -153,11 +153,11 @@ const LOCAL_EXECUTION_TOOLS = [
   //   ③ 插件装载权（= 任意代码执行）
   'plugin_manager',
   //   ④ 无人值守的自我调度
-  //   0.2.1 起 `dsh-tool-schedule` 把 update/delete 改名为 view/edit（与 0.2.2 适配文档
-  //   记的是同一处改名），所以挡新名；旧名 update/delete 归入
-  //   OPTIONAL_BUNDLE_TOOL_NAMES（老版本真实存在、新版本不存在，不能当假名删掉）。
+  //   名字随 DSH 版本变：0.2.0 及更早是 update/delete，0.2.1 起改名 view/edit。
+  //   四种都挡，但都归入 OPTIONAL_BUNDLE_TOOL_NAMES —— 一次安装只可能存在其中一对，
+  //   另一对 restrict 会抛错（被 apply() 逐个 try/catch 吞掉），扫描器也不该把它
+  //   判成假名（否则在 0.2.0 和 0.2.1 两种机器上会各报一次假红）。
   'schedule_create', 'schedule_list',
-  'schedule_view', 'schedule_edit',
   // 0.2.1 新增对账（2026-10-22，见上方长注释）：
   //   ① dsh-base 默认启用 ⇒ 全局层继承
   'working_directory',
@@ -187,11 +187,14 @@ const LOCAL_EXECUTION_TOOLS = [
 export const OPTIONAL_BUNDLE_TOOL_NAMES = Object.freeze([
   'subagent_codex',
   'subagent_claude_code',
-  // 0.2.0 及更早的 `dsh-tool-schedule` 用的是 update/delete，0.2.1 起改名 view/edit。
-  // 新装机器上这两个旧名扫不到，但老版本仍会注册它们，所以留在名单里当回归网；
-  // 放在本组是为了让扫描器/测试把「版本差异」和「拼错假名」区分开。
+  // dsh-tool-schedule 的两代名字：0.2.0 及更早用 update/delete，0.2.1 起改名 view/edit。
+  // 一次安装只可能存在其中一对，另一对 restrict 会抛错（apply() 逐个 try/catch 吞掉，
+  // 计入「本版本不存在」）。放本组是为了让扫描器/测试把「版本差异」与「拼错假名」分开，
+  // 否则 0.2.0 机器会把 view/edit 报假红、0.2.1 机器会把 update/delete 报假红。
   'schedule_update',
   'schedule_delete',
+  'schedule_view',
+  'schedule_edit',
   // dsh-plugin-guard 提供（可选 bundle，本机 profile 没装）。上游要求这三个名字
   // 必须在守卫名单里，所以不能删；本机启动日志里那三行
   // `skip restrict <name>: unknown global tool` 是预期噪音，不是 bug。
