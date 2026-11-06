@@ -153,7 +153,9 @@ export function buildPatches({ check = false, log = () => {} } = {}) {
     const file = patchFileFor(name);
     const content = renderPatch(name);
     const current = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
-    const changed = current === null || toLF(current) !== toLF(content);
+    // Git may check text files out as CRLF on Windows; line endings are not
+    // preset drift. YAML string escapes remain intact in this comparison.
+    const changed = current?.replace(/\r\n/g, '\n') !== content;
     if (changed && !check) {
       const eol = current !== null && /\r\n/.test(current) ? '\r\n' : '\n';
       fs.mkdirSync(path.dirname(file), { recursive: true });

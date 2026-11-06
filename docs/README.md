@@ -1,9 +1,16 @@
 # 文档索引（docs/README.md）
 
 > 根目录只留 `README.md` / `README.en.md` / `RULES.md` 三个文档，其余全部在本目录下。
+> 例外是 GitHub 社区健康文件与许可正文，它们按 GitHub 的约定放在根/`.github`：
+> `LICENSE`、`NOTICE.md`（著作权、许可范围与第三方组件声明）、`SECURITY.md`、
+> `CONTRIBUTING.md`、`.github/`（issue 表单、PR 模板、CI）。
 > 仓库目录结构与 `scripts/` 命名约定见 **[FOLDER_MAP.md](FOLDER_MAP.md)**。
 >
 > **状态标记**：✅ 仍然有效（按它做就对） · ⚠️ 部分过时（见备注） · 🗄️ 已被取代（保留作背景）
+>
+> **未入库文档**：`audits/`、`design/`、`legacy/`、`research/` 四个目录，以及
+> `guides/PROJECT_GUIDE.md`、`guides/VOICE.md`，只存在于本地开发副本（已被 `.gitignore` 排除），
+> 公开仓库中无法访问。索引保留这些条目是为了本地检索。
 
 ---
 
@@ -11,6 +18,9 @@
 
 | 文档 | 一句话说明 | 状态 |
 | --- | --- | --- |
+| [guides/CODE_SCANNING_2026-10-31.md](guides/CODE_SCANNING_2026-10-31.md) | 14 条 CodeQL 告警的风险判断、本地修复与复扫边界 | ✅ 2026-10-31 |
+| [guides/ISSUE_STATUS_2026-10-31.md](guides/ISSUE_STATUS_2026-10-31.md) | 62 个未关闭 issues 的逐项核查、已修复证据、本轮修复与待复现事项 | ✅ 2026-10-31 |
+| [guides/AUDIT_2026-10-31.md](guides/AUDIT_2026-10-31.md) | 仓库安全与架构体检：跨会话资料隔离、发送撤权、联网与路径边界、依赖及历史隐私扫描、升级注意事项 | ✅ 2026-10-31 |
 | [guides/PROJECT_GUIDE.md](guides/PROJECT_GUIDE.md) | **权威项目说明书**（113 KB / 1450+ 行）：架构、内外核划分、数据流、配置全解、安全机制、调试与改进指南，含 2026-08-20 ~ 2026-09-11 的逐轮更新记录 | ✅ **唯一权威版本**（另一份同名精简版已归档到 legacy，见下） |
 | [guides/DSH_SETUP.md](guides/DSH_SETUP.md) | DSH 端安装说明：`qq-chat` / `qq-chat-v2` preset 与三个 MCP server 怎么挂到目标设备的 DSH 上 | ✅ |
 | [guides/VOICE.md](guides/VOICE.md) | 语音发送全解：独立工具（`voice-tool/` 的图形界面与命令行）、桥接 CLI、AI 工具、控制台面板，以及**工具拆出后的配置解析顺序** | ✅ 2026 整理时已更新（工具移到上一级 `voice-tool/`） |
@@ -71,7 +81,7 @@
 | --- | --- |
 | 搞懂整体架构 / 全部配置项 | [guides/PROJECT_GUIDE.md](guides/PROJECT_GUIDE.md) |
 | 在新设备上把 qq-bridge 接进 DSH | [guides/DSH_SETUP.md](guides/DSH_SETUP.md) |
-| 发语音 / 换 QQ 账号后语音工具 401 | [guides/VOICE.md](guides/VOICE.md)（独立工具在仓库上一级 `../voice-tool/`） |
+| 发语音 / 换 QQ 账号后语音工具 401 | guides/VOICE.md（**本地专属，未入库**；独立工具在仓库上一级 `../voice-tool/`） |
 | 看 AI 烧了多少钱 / 计价口径 | [guides/TOKEN_USAGE_CONSOLE.md](guides/TOKEN_USAGE_CONSOLE.md)、[audits/TOKEN_COST_ANALYSIS.md](audits/TOKEN_COST_ANALYSIS.md) |
 | 改控制台界面并做离线回归 | [guides/CONSOLE-UI-TESTING.md](guides/CONSOLE-UI-TESTING.md)、[audits/CONSOLE_UI_REDESIGN_REPORT.md](audits/CONSOLE_UI_REDESIGN_REPORT.md) |
 | 改代码前先知道有哪些坑 | [guides/DSH_020_ADAPTATION.md](guides/DSH_020_ADAPTATION.md)（最新，DSH 适配）、[audits/AUDIT_FIXES_2026-09-20.md](audits/AUDIT_FIXES_2026-09-20.md)、[audits/AUDIT_REPORT_2026-09-20.md](audits/AUDIT_REPORT_2026-09-20.md) |
