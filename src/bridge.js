@@ -3865,6 +3865,15 @@ async function main() {
   })();
   // prompt 投出后多久还没等到 turn/start 就认为 DSH 没接住（刚重启、MCP 还在注册时不接单）。
   const PROMPT_PICKUP_MS = 2 * 60 * 1000;
+  // session.create 遇到 `agent-preset/not-found` 时的重试次数（含首次）。
+  // 只有配置热重载窗口才会出现这个错：DSH 重写 cordis.patch.yml 时注册表会短暂清空，几秒后恢复。
+  const SESSION_CREATE_RETRIES = 4;
+  // 唤醒投递失败后的退避：失败路径原本会立刻被下一次 timeout 唤醒再撞一次，
+  // 在「DSH 热重载 / 会话建不出来」的持续窗口里会退化成 1 秒一次的日志风暴 + 消息白丢。
+  const WAKE_FAILURE_BACKOFF_MS = (() => {
+    const v = Number(cfg.socialV2?.wake?.failureBackoffMs);
+    return Number.isFinite(v) && v >= 0 ? v : 60_000;
+  })();
   // 清掉一个会话的卡死回合后，把积压的第一条唤醒原因重新排上（其余留在队列里等下一轮）。
   function replayPendingWake(key) {
     const st = getSocialV2State(key);
@@ -9847,7 +9856,23 @@ async function main() {
           // 「这次调用是不是当前会话」，这个值模型看不到也改不了（见 encodeSelfKey）。
           const boundSessionId = encodeSelfKey(key);
           if (boundSessionId) params.sessionId = boundSessionId;
-          const value = unwrap(await api.sessions.create(params), 'session.create');
+          // 配置热重载窗口（DSH 写 cordis.patch.yml / 切 profile）期间 agentPreset 注册表会短暂为空，
+          // session.create 于是回 agent-preset/not-found。这是**瞬时**的：等注册表回来就能建。
+          // 不重试的后果是消息永久丢失（唤醒投递失败后不会自动补投），所以这里做有限重试。
+          let value;
+          for (let attempt = 1; ; attempt += 1) {
+            try {
+              value = unwrap(await api.sessions.create(params), 'session.create');
+              break;
+            } catch (error) {
+              const message = String(error?.message ?? error);
+              const transient = /agent-preset\/not-found|Unknown agent preset/i.test(message);
+              if (!transient || attempt >= SESSION_CREATE_RETRIES) throw error;
+              const delay = 1000 * attempt;
+              log(`会话 ${key}：preset ${preset} 暂时不在 DSH 注册表（配置重载窗口？），${delay}ms 后重试（${attempt}/${SESSION_CREATE_RETRIES - 1}）`);
+              await sleep(delay);
+            }
+          }
           sessionId = value.sessionId;
           if (withPreset && preset) {
             log(`会话 ${key} 已挂载 preset ${preset}`);
@@ -12422,6 +12447,16 @@ async function main() {
         setupSleepTimerV2(key);
       }
       log(`[reserved2] 唤醒投递失败 ${key}: ${error?.message ?? error}`);
+      // 退避后再试：失败时状态被回滚成「可立即唤醒」，若不加这把闸，
+      // reply-check/timeout 会在 1 秒内再次触发唤醒，形成日志风暴且每次都失败。
+      if (WAKE_FAILURE_BACKOFF_MS > 0) {
+        const retryAt = new Date(Date.now() + WAKE_FAILURE_BACKOFF_MS);
+        st.wakeConfig.sleepUntil = retryAt.toISOString();
+        st.wakeConfig.infinite = false;
+        saveSocialV2State();
+        setupSleepTimerV2(key);
+        log(`[reserved2] ${key} 唤醒将退避 ${Math.round(WAKE_FAILURE_BACKOFF_MS / 1000)}s 后重试（${retryAt.toLocaleTimeString('zh-CN', { hour12: false })}）`);
+      }
     }
   }
 
