@@ -30,6 +30,7 @@
 | [guides/HEALTH.md](guides/HEALTH.md) | **健康检查**：`health.cmd` / `scripts/health-check.mjs` 的五条断言（OneBot HTTP/WS、桥接、DSH、MCP 工具表新鲜度）、`--json`/`--fix`、退出码与排错顺序 | ✅ 2026-10-31 新增 |
 | [guides/ADMIN_COMMANDS.md](guides/ADMIN_COMMANDS.md) | **管理员命令**：`/help` `/status` `/reset` `/log` `/pause` `/resume` `/role` `/silent` `/recall` `/语音` 一览与冷却、非管理员为何静默、`/log` 的脱敏规则、日志落盘/轮转/等级/去重、改代码后的四步验收 | ✅ 2026-10-31 新增 |
 | [guides/MEMORY.md](guides/MEMORY.md) | **机器人记忆**：meow-memory 装进 QQ 侧 DSH 的完整步骤、为什么要在 `qq-tool-restrict` 放行 6 个 `memory_*`（以及哪两个故意不放）、记忆库落在 `<工作区>\.dsh-meow\memory.db`、配置项、探针验证与关闭/卸载 | ✅ 2026-11-07 新增 |
+| [guides/ENDPOINT_SWITCH.md](guides/ENDPOINT_SWITCH.md) | **换协议端（OneBot v11）**：SnowLuma 停维护后的替代路径——桥接只认 `wsUrl`/`httpUrl`/`accessToken` 三字段、换端三步、兼容性清单、换端后要重做的事、回滚 | ✅ 2026-11-11 新增 |
 | [guides/TOKEN_USAGE_CONSOLE.md](guides/TOKEN_USAGE_CONSOLE.md) | 控制台「令牌与花费」看板：数据来源、计价口径（峰谷分时）、API、配置 | ✅ |
 | [guides/CONSOLE-UI-TESTING.md](guides/CONSOLE-UI-TESTING.md) | 控制台离线预览（`npm run preview:console`）与离线浏览器回归（`npm run test:console-ui`）怎么用 | ✅ 2026 整理时自 `scripts/` 移入 |
 | [guides/SECURITY_BASELINE.md](guides/SECURITY_BASELINE.md) | **安全基线与威胁模型**：威胁主体、已实现的边界（准入/工具面/出站/控制台/落盘/网络）、已知残余风险、发布前回归清单、改动检查单 | ✅ **改动安全相关代码前必读**（2026-09-20 新增） |

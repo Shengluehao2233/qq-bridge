@@ -22,7 +22,8 @@
     "followDiscoveredEndpoint": true,
     "silenceWarnMs": 600000,
     "launcherPath": "",
-    "homeDir": ""
+    "homeDir": "",
+    "_switchNote": "换协议端只需改 wsUrl / httpUrl / accessToken 三行，并把 followDiscoveredEndpoint 设为 false；兼容性清单与步骤见 docs/guides/ENDPOINT_SWITCH.md"
   },
   "ownerQQ": null,
   "admins": {
