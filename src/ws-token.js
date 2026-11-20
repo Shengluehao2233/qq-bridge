@@ -7,7 +7,9 @@
 //      (a discovered different endpoint is ignored with a warning);
 //   2. with no explicit token and endpoint following enabled, use the discovered account pair;
 //   3. with no explicit token and following disabled, accept a discovered token only when the discovered
-//      endpoint matches the configured endpoint exactly (no cross-account credential reuse).
+//      endpoint matches the configured endpoint exactly (no cross-account credential reuse);
+//   4. with following disabled and a mismatched discovered endpoint, keep the token the client is already
+//      using for the configured endpoint (a self-heal must not downgrade a working WS token to the HTTP one).
 // The HTTP token is only a flagged compatibility fallback; the resolver never claims WS auth success.
 
 function normalizeUrl(value) {
@@ -24,13 +26,16 @@ export function resolveWsTarget({
   httpToken,
   discovered,
   followEndpoint,
+  currentUrl,
+  currentToken,
 } = {}) {
   const cfgUrl = String(configuredWsUrl || '').trim();
   const cfgNorm = normalizeUrl(cfgUrl);
   const cfgToken = typeof configuredWsToken === 'string' ? configuredWsToken.trim() : '';
   const follow = followEndpoint !== false;
+  // 不要求 discovered.ok：调用方（自愈）拿到的既有结果里可能没有这个字段，
+  // 而 wsUrl + 非空 wsToken 才是真正决定能不能建立配对的依据。
   const discOk = !!(discovered
-    && discovered.ok
     && typeof discovered.wsUrl === 'string'
     && typeof discovered.wsToken === 'string'
     && discovered.wsToken.trim());
@@ -59,6 +64,14 @@ export function resolveWsTarget({
 
   if (discOk && !follow && cfgNorm && discNorm === cfgNorm) {
     return { url: cfgUrl, token: discToken, source: 'discovery-same-endpoint', warning: null };
+  }
+
+  // 没有可用的发现配对（未跟随，或这次只发现到 HTTP token）时，保留当前连在配置端点上的
+  // token：一次自愈不该把已经用 WS token 建好的连接降级成 HTTP token（WS 侧随后 1006），
+  // 也不该把发现的凭据套到别的端点上。
+  const curToken = typeof currentToken === 'string' ? currentToken.trim() : '';
+  if (curToken && cfgNorm && normalizeUrl(currentUrl) === cfgNorm) {
+    return { url: cfgUrl, token: curToken, source: 'current', warning: null };
   }
 
   const http = typeof httpToken === 'string' ? httpToken.trim() : '';
@@ -97,6 +110,8 @@ export function planWsPairUpdate({
     httpToken,
     discovered,
     followEndpoint,
+    currentUrl,
+    currentToken,
   });
   return {
     url: target.url,

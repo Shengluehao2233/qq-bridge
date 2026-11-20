@@ -21,6 +21,7 @@ import test from 'node:test';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { planConfigUpdate, planWsPairUpdate, resolveWsTarget } from '../src/ws-token.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const bridge = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8');
@@ -179,11 +180,52 @@ test('端点自愈可关，且默认保持「跟随」（向后兼容）', () =>
     example.snowluma?.followDiscoveredEndpoint, true,
     '示例配置里默认值必须是 true —— 关闭会改变既有自愈行为，不能悄悄改默认',
   );
-  // 关掉时不得把发现的端点写回文件
-  assert.match(
-    bridgeCode,
-    /\.\.\.\(followEndpoint \? \{ wsUrl, httpUrl: r\.baseUrl \} : \{\}\)/,
-    '关闭跟随时不得把 wsUrl 写回 config.json（否则"我设了别处"会被持久化抹掉）',
+  // 关掉时不得把发现的端点写回文件：直接验证配对规则（#174 起由 src/ws-token.js 承载，
+  // 不再靠匹配 bridge.js 源码里的展开表达式）。
+  const discovered = { wsUrl: 'ws://127.0.0.1:4001', baseUrl: 'http://127.0.0.1:4000', wsToken: 'foreign-ws', token: 'foreign-http' };
+  const offPlan = planWsPairUpdate({
+    configuredWsUrl: 'ws://127.0.0.1:3001', configuredWsToken: '', httpToken: 'a', discovered, followEndpoint: false,
+  });
+  assert.deepEqual(
+    planConfigUpdate({
+      plan: offPlan, followEndpoint: false, configuredWsToken: '', configuredWsUrl: 'ws://127.0.0.1:3001',
+      configuredHttpUrl: 'http://127.0.0.1:3000', discoveredBaseUrl: 'http://127.0.0.1:4000',
+    }).persist,
+    {},
+    '关闭跟随时不得把 wsUrl/httpUrl 写回 config.json（否则"我设了别处"会被持久化抹掉）',
+  );
+  const onPlan = planWsPairUpdate({
+    configuredWsUrl: 'ws://127.0.0.1:3001', configuredWsToken: '', httpToken: 'a', discovered, followEndpoint: true,
+  });
+  assert.deepEqual(
+    planConfigUpdate({
+      plan: onPlan, followEndpoint: true, configuredWsToken: '', configuredWsUrl: 'ws://127.0.0.1:3001',
+      configuredHttpUrl: 'http://127.0.0.1:3000', discoveredBaseUrl: 'http://127.0.0.1:4000',
+    }).persist,
+    { wsUrl: 'ws://127.0.0.1:4001', httpUrl: 'http://127.0.0.1:4000' },
+    '默认（跟随）时应把发现到的端点持久化',
+  );
+  // 显式 wsToken 钉住配置端点：发现别的端点时既不换 URL，也不写回。
+  const pinned = planWsPairUpdate({
+    configuredWsUrl: 'ws://127.0.0.1:3001', configuredWsToken: 'pinned', httpToken: 'a', discovered, followEndpoint: true,
+  });
+  assert.equal(pinned.url, 'ws://127.0.0.1:3001');
+  assert.equal(pinned.token, 'pinned');
+  assert.deepEqual(
+    planConfigUpdate({
+      plan: pinned, followEndpoint: true, configuredWsToken: 'pinned', configuredWsUrl: 'ws://127.0.0.1:3001',
+      configuredHttpUrl: 'http://127.0.0.1:3000', discoveredBaseUrl: 'http://127.0.0.1:4000',
+    }).persist,
+    {},
+    '显式 wsToken 时不得把别的端点写回',
+  );
+  // 端点相同且只发现到 token（无跟随）时仍要接受该 token。
+  assert.equal(
+    resolveWsTarget({
+      configuredWsUrl: 'ws://127.0.0.1:3001/', configuredWsToken: '', httpToken: 'a',
+      discovered: { wsUrl: 'ws://127.0.0.1:3001', wsToken: 'same-ep' }, followEndpoint: false,
+    }).token,
+    'same-ep',
   );
   assert.equal(typeof example.snowluma?.silenceWarnMs, 'number', '示例配置应记录静默告警阈值');
 });
