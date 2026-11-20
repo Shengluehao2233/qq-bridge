@@ -160,7 +160,10 @@ await test('快照头部带 now 与 newestAgo，消息体带 at/ago 且不再有
     assert.equal(snapshot.newestAgo, '25m');
     for (const message of snapshot.messages) {
       assert.equal(message.time, undefined, '快照里不该再有裸 epoch');
-      assert.match(message.at, /^\d{2}:\d{2}$/);
+      // 当天消息只渲染 hh:mm，跨天会带「MM-DD 」前缀——这是产品行为，不是回归。
+      // 夹具用 ageMs 造 25 分钟前的消息，只要跑测试的时刻离午夜不足 25 分钟，
+      // 它就会落在昨天（2026-11-21 00:04 跑出来是「11-20 23:38」），两种形态都要认。
+      assert.match(message.at, /^(?:\d{2}-\d{2} )?\d{2}:\d{2}$/);
       assert.match(message.ago, /^\d+[smhd]$/);
     }
     assert.equal(snapshot.messages[1].ago, '25m');
