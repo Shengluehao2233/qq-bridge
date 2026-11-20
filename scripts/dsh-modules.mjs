@@ -41,6 +41,30 @@ function candidateProfiles(home) {
   return names;
 }
 
+// 解析当前实际使用的 profile（#183）：不再写死 profiles/web。
+//
+// 优先级：DSH_PROFILE（显式指定，永远优先）→ 已存在的 web → 已存在的 default →
+// profiles 下唯一目录 → 兜底 { name: 'web', exists: false }。
+// 返回 { name, exists }：exists=false 时调用方应跳过依赖 profile 的断言，而不是写死一个不存在的目录。
+export function resolveProfile(home = dshHome()) {
+  const dirOf = (n) => path.join(home, 'profiles', n);
+  const explicit = process.env.DSH_PROFILE;
+  // 显式指定优先，但只在目录确实存在时生效：否则继承环境里的 DSH_PROFILE
+  // （例如 agent 自己的 shell 带着 DSH_PROFILE=desktop）会指到别的 home 里不存在的目录。
+  if (explicit && fs.existsSync(dirOf(explicit))) return { name: explicit, exists: true };
+  const preferred = explicit || null;
+  for (const n of ['web', 'default']) {
+    if (fs.existsSync(dirOf(n))) return { name: n, exists: true };
+  }
+  try {
+    const dirs = fs.readdirSync(path.join(home, 'profiles'), { withFileTypes: true })
+      .filter((e) => e.isDirectory()).map((e) => e.name);
+    if (dirs.length === 1) return { name: dirs[0], exists: true };
+    if (dirs.length > 1) return { name: dirs[0], exists: true };
+  } catch { /* profiles 目录不存在 */ }
+  return { name: preferred || 'web', exists: false };
+}
+
 export function dshModulesDir() {
   const override = process.env.DSH_INSTALL_MODULES || process.env.DSH_MODULES;
   if (override) return override;

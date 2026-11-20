@@ -24,6 +24,8 @@ function fixture(name, patch = '') {
   fs.copyFileSync(path.join(root, 'scripts/setup-dsh.mjs'), path.join(repo, 'scripts/setup-dsh.mjs'));
   // setup-dsh.mjs 直接从仓库源生成 bundle patch，生成器必须一起进夹具。
   fs.copyFileSync(path.join(root, 'scripts/build-agent-preset-patches.mjs'), path.join(repo, 'scripts/build-agent-preset-patches.mjs'));
+  // setup-dsh.mjs 现在 import ./dsh-modules.mjs 解析默认 profile（#183），夹具要一并带上。
+  fs.copyFileSync(path.join(root, 'scripts/dsh-modules.mjs'), path.join(repo, 'scripts/dsh-modules.mjs'));
   fs.cpSync(path.join(root, 'dsh'), path.join(repo, 'dsh'), { recursive: true });
   fs.cpSync(path.join(root, 'plugins'), path.join(repo, 'plugins'), { recursive: true });
   fs.cpSync(parserRoot, path.join(repo, 'node_modules/js-yaml'), { recursive: true });

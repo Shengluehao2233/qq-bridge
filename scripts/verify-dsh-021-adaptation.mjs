@@ -38,7 +38,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { dshModulesDir } from './dsh-modules.mjs';
+import { dshModulesDir, resolveProfile } from './dsh-modules.mjs';
 import { discoverDshSessionCookie, NodeApiClient, unwrap } from '../src/dsh-client.js';
 
 const ROOT = process.cwd();
@@ -47,6 +47,9 @@ const DSH_MODULES = dshModulesDir();
 // 硬编码 os.homedir()/.dsh 会去检查错误的实例（profile patch 结构不同，还会直接崩）。
 // 与 scripts/dsh-modules.mjs 的 dshHome() 保持同一口径。
 const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+// profile 目录不再写死 profiles/web（#183）：按 resolveProfile() 的实际结果走。
+const PROFILE_INFO = resolveProfile(DSH_HOME);
+const PROFILES_DIR = path.join(DSH_HOME, 'profiles', PROFILE_INFO.name);
 const BASE = process.env.DSH_BASE_URL || 'http://127.0.0.1:3080';
 // 防呆（2026-10-24 真踩过，白查一轮）：DSH_HOME 指向 qq 实例（~/.dsh-qq）却忘了设
 // DSH_BASE_URL 时，BASE 还是默认 3080 —— 那是**桌面那个 DSH**，验出来的
@@ -187,7 +190,7 @@ if (scanned.names.size === 0) {
   check('守卫名单无拼错的假名（restrict 不会静默失效）', fabricated.length === 0, fabricated.join(', ') || `扫过 ${scanned.packages.length} 个包`);
 }
 
-const patch = fs.readFileSync(path.join(DSH_HOME, 'profiles/web/cordis.patch.yml'), 'utf8');
+const patch = fs.readFileSync(path.join(PROFILES_DIR, 'cordis.patch.yml'), 'utf8');
 const patchDoc = yaml.load(patch);
 const mcpIds = patchDoc.filter((e) => e?.insert).flatMap((e) => e.insert.map((x) => x.id));
 check('profile patch 含 3 个 MCP 且无重复', mcpIds.length === 3 && new Set(mcpIds).size === 3, mcpIds.join(', '));
@@ -198,10 +201,10 @@ check('mcp 路径指向本仓库', mcpIds.every((id) => {
   return String(e.config.args[0]).includes('qq-bridge');
 }));
 
-const pkg = JSON.parse(fs.readFileSync(path.join(DSH_HOME, 'profiles/web/package.json'), 'utf8'));
+const pkg = JSON.parse(fs.readFileSync(path.join(PROFILES_DIR, 'package.json'), 'utf8'));
 check('profile bundles 含 qq-mode-console', pkg.dsh.profile.bundles.includes('qq-mode-console'));
 check('qq-mode-console link 依赖已注册', String(pkg.dependencies['qq-mode-console'] ?? '').startsWith('link:'));
-check('qq-mode-console 已 link 进 node_modules', fs.existsSync(path.join(DSH_HOME, 'profiles/web/node_modules/qq-mode-console')));
+check('qq-mode-console 已 link 进 node_modules', fs.existsSync(path.join(PROFILES_DIR, 'node_modules', 'qq-mode-console')));
 
 // ── 3. 仓库配置：模型 ───────────────────────────────────────────────────────
 const cfg = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8'));

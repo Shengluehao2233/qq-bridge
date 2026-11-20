@@ -14,6 +14,7 @@
 //
 // 默认 profile 为 web；可用环境变量 DSH_HOME 指定 DSH 根目录。
 import fs from 'node:fs';
+import { resolveProfile } from './dsh-modules.mjs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -24,7 +25,7 @@ import { BUNDLE_DIR, PRESETS, buildPatches, patchFileFor } from './build-agent-p
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
 const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
-const PROFILE = process.argv[2] || 'web';
+const PROFILE = process.argv[2] || resolveProfile().name;
 
 // A profile is a directory name, never a path (same boundary as DSH itself).
 if (PROFILE === '.' || PROFILE === '..' || PROFILE === 'node_modules'
