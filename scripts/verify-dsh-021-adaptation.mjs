@@ -316,8 +316,14 @@ if (qqMode) {
 }
 
 // ── 5b. session/projections：读会话队列的主路径 ──────────────────────────────
-const probeDir = path.join(os.tmpdir(), 'qq-bridge-verify-020');
-fs.rmSync(probeDir, { recursive: true, force: true });
+// 上一轮异常退出会留下同名目录，DSH 侧会话可能还持有句柄（Windows EPERM 删不掉）。
+// 这里退让：删不掉就换一个唯一目录，不让清理失败再制造一次“假红”。
+let probeDir = path.join(os.tmpdir(), 'qq-bridge-verify-020');
+try {
+  fs.rmSync(probeDir, { recursive: true, force: true });
+} catch {
+  probeDir = path.join(os.tmpdir(), 'qq-bridge-verify-020-' + Date.now().toString(36));
+}
 fs.mkdirSync(probeDir, { recursive: true });
 const api = new NodeApiClient(BASE, undefined, {});
 await api.ensureAuth();
