@@ -153,18 +153,24 @@ export async function resolveSafeAddresses(hostname) {
     throw new Error(`域名解析失败：${error?.message ?? error}`);
   }
   if (!addresses.length) throw new Error('域名没有解析结果');
-  for (const { address } of addresses) {
-    if (isPrivateIp(address)) {
-      if (/^198\.(?:18|19)\./.test(address)) {
-        throw new Error('域名解析到 198.18.0.0/15 保留地址，已阻止；这可能是 Clash/mihomo 的 fake-ip。'
-          + '请使用返回真实公网 IP 的 DNS（如 redir-host），或按代理的 fake-ip-filter 规则让该域名返回真实地址。'
-          + '私有/保留地址不会被放行');
-      }
-      throw new Error('域名解析到内网/本机地址，已阻止');
+  // 只丢弃**解析到内网/保留段的那几条**，而不是「有一条内网就整域名拒绝」。
+  // 为什么：Clash/mihomo 的 fake-ip 把公网域名解析到 198.18.0.0/15，一次解析里只要
+  // 混进一条假地址，整域名就不可达 —— 现象是「QQ 表情/图片时好时坏，日志里候选全被
+  // blocked」，且只在代理开着时复现（上游 issue #40）。
+  // 安全性没有降低：attemptOnce 直接用**校验过的 IP** 建连（保留 Host/SNI），不会
+  // 二次解析，所以「先返回公网、连接时返回内网」的 DNS rebinding 依旧防得住。
+  // 全部结果都是内网时照旧拒绝（fail-closed），不把「解析失败」误当成「可以放行」。
+  const publicAddresses = addresses.filter(({ address }) => !isPrivateIp(address));
+  if (!publicAddresses.length) {
+    if (addresses.every(({ address }) => /^198\.(?:18|19)\./.test(address))) {
+      throw new Error('域名解析到 198.18.0.0/15 保留地址，已阻止；这可能是 Clash/mihomo 的 fake-ip。'
+        + '请使用返回真实公网 IP 的 DNS（如 redir-host），或按代理的 fake-ip-filter 规则让该域名返回真实地址。'
+        + '私有/保留地址不会被放行');
     }
+    throw new Error('域名解析到内网/本机地址，已阻止');
   }
-  const ordered = orderAddresses(addresses);
-  return ordered.length ? ordered : [addresses[0].address];
+  const ordered = orderAddresses(publicAddresses);
+  return ordered.length ? ordered : [publicAddresses[0].address];
 }
 
 export async function resolveSafeHost(hostname) {
