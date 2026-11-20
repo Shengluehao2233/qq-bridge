@@ -32,6 +32,7 @@ import * as adminTokens from '../src/admin-tokens.js';
 import * as qqDocs from '../src/qq-docs.js';
 import * as mediaCache from '../src/media-cache.js';
 import * as tts from '../src/tts/index.js';
+import * as wsToken from '../src/ws-token.js';
 import { persistSnowLumaEndpoint, persistToken } from '../src/snowluma-conn.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
@@ -222,6 +223,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt, ...videoDigest, ...roleCard,
     ...adminCommands,
     ...adminTokens,
+    ...wsToken,
     // 只注入 bridge.js 真正 import 的名字：qq-docs 也导出 truncateText（返回 {text,truncated}），
     // 整体展开会把 md-to-plain 的 truncateText 覆盖掉，消息入库就存成 "[object Object]"。
     extractDocument: qqDocs.extractDocument,
