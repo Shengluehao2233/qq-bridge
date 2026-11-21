@@ -28,6 +28,7 @@
 | [guides/VIDEO.md](guides/VIDEO.md) | **视频理解**：群里发的视频怎么变成「联系表截图 + Whisper 转写」喂给模型、`config.socialV2.media.video` 全字段、uv/ffmpeg/skill 依赖、链接看视频的 `watch.py` 用法、排错表 | ✅ 2026-10-26 新增 |
 | [guides/FILES.md](guides/FILES.md) | **群文件与文档读取**：`qq_list_group_files` / `qq_download_file` 两个工具怎么把 docx/pdf/xlsx/pptx 变成文本或页面图片、`config.files` 全字段、为什么必须在桥接侧解析（L7）、安全底线与排错表 | ✅ 2026-10-31 新增 |
 | [guides/HEALTH.md](guides/HEALTH.md) | **健康检查**：`health.cmd` / `scripts/health-check.mjs` 的五条断言（OneBot HTTP/WS、桥接、DSH、MCP 工具表新鲜度）、`--json`/`--fix`、退出码与排错顺序 | ✅ 2026-10-31 新增 |
+| [guides/SUPERVISOR.md](guides/SUPERVISOR.md) | 守护进程：DSH 3082 / 桥接 3100 掉链自愈（退避 + 熔断 + 启动宽限） | ✅ 2026-11-22 新增 |
 | [guides/ADMIN_COMMANDS.md](guides/ADMIN_COMMANDS.md) | **管理员命令**：`/help` `/status` `/reset` `/log` `/pause` `/resume` `/role` `/silent` `/recall` `/语音` 一览与冷却、非管理员为何静默、`/log` 的脱敏规则、日志落盘/轮转/等级/去重、改代码后的四步验收 | ✅ 2026-10-31 新增 |
 | [guides/MEMORY.md](guides/MEMORY.md) | **机器人记忆**：meow-memory 装进 QQ 侧 DSH 的完整步骤、为什么要在 `qq-tool-restrict` 放行 6 个 `memory_*`（以及哪两个故意不放）、记忆库落在 `<工作区>\.dsh-meow\memory.db`、配置项、探针验证与关闭/卸载 | ✅ 2026-11-07 新增 |
 | [guides/ENDPOINT_SWITCH.md](guides/ENDPOINT_SWITCH.md) | **换协议端（OneBot v11）**：SnowLuma 停维护后的替代路径——桥接只认 `wsUrl`/`httpUrl`/`accessToken` 三字段、换端三步、兼容性清单、换端后要重做的事、回滚 | ✅ 2026-11-11 新增 |

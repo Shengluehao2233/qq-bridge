@@ -73,7 +73,8 @@
     "test:admin": "node scripts/test-admin-commands.mjs",
     "test:admin-tokens": "node scripts/test-admin-tokens.mjs",
     "test:roles": "node scripts/test-admin-commands.mjs && node scripts/test-admin-tokens.mjs",
-    "test:role-inject": "node scripts/test-role-injection-cadence.mjs"
+    "test:role-inject": "node scripts/test-role-injection-cadence.mjs",
+    "supervisor": "node scripts/dsh-supervisor.mjs"
   },
   "dependencies": {
     "@deepseek-ai/dsh-host-apiproxy": "0.1.1-rc.2",
