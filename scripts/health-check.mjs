@@ -135,10 +135,24 @@ async function checkBridge() {
     const mode = body?.mode ?? '?';
     const ready = body?.dshReady === true;
     const owner = body?.ownerQQ ?? '?';
+    // 桥接实际连着的 DSH 地址必须就是我们检查的这个端口。
+    // 只信 dshReady 会漏掉「端点自愈把连接改到了另一台 DSH」的情况：
+    // 2026-11-22 桥接自愈接到桌面版随机端口 11533，dshReady 一直是 true，
+    // 而 QQ 消息实际由桌面 profile 的 agent 处理。
+    const connectedBase = String(body?.dshBaseUrl ?? '');
+    const expectedBase = `http://127.0.0.1:${dshPort}`;
+    const endpointOk = !connectedBase || connectedBase === expectedBase;
     if (!ready) {
       report('桥接（qq-bridge）', 'fail', `端口通但 dshReady=false（mode=${mode}）`, `DSH ${dshPort} 没起来或桥接还没连上，先起 DSH`);
+    } else if (!endpointOk) {
+      report(
+        '桥接（qq-bridge）',
+        'fail',
+        `连的是 ${connectedBase}，不是 ${expectedBase}（dshAutoDiscover=${body?.dshAutoDiscover === true}）`,
+        '桥接被端点自愈带偏了：重启桥接，并确认 config.json 里 dsh.autoDiscoverPort=false、dsh.baseUrl 指向本机 DSH'
+      );
     } else {
-      report('桥接（qq-bridge）', 'ok', `:${bridgePort} · mode=${mode} · dshReady=true · ownerQQ=${owner}`);
+      report('桥接（qq-bridge）', 'ok', `:${bridgePort} · mode=${mode} · dshReady=true · dsh=${connectedBase || expectedBase} · ownerQQ=${owner}`);
     }
     return body;
   } catch (error) {

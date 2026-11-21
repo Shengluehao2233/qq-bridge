@@ -49,11 +49,20 @@ export function normalizeDshBaseUrl(value) {
  *
  * 只发一次 `settings/describe`（桥接每个探活周期本来就在调它），
  * 因此严格来说这是「把同一个探活请求发给另一个候选地址」。
+ *
+ * `requireNamespace`：把「同一台机器上的另一个 DSH」挡在外面。
+ * 本机实测：桌面版 DSH 与 CLI 版 DSH 会同时监听，两者都认离线铸造的 Cookie
+ * （签名密钥在本机、按 home 目录铸造），所以「能跑通 settings/describe」并不足以
+ * 证明它是**我们这个 bot 的** DSH。2026-11-22 凌晨就是这样把请求接给了桌面版
+ * （3082 被睡眠带走后，桥接「自愈」到桌面版的随机端口 11533），QQ 消息实际由
+ * 桌面 profile 的 agent 处理。这里用命名空间做身份校验：QQ 侧 home 装了
+ * `qq-mode-console`，它一定带 `qq-mode` 命名空间，桌面版没有。
  * @param baseUrl - 候选 DSH 基址。
  * @param options.timeoutMs - 超时上限。
- * @returns 该地址是否返回 ok 的 server-response。
+ * @param options.requireNamespace - 必须存在的 settings 命名空间（如 "qq-mode"）。
+ * @returns 该地址是否返回 ok 的 server-response（且带上了要求的命名空间）。
  */
-export async function probeDshBaseUrl(baseUrl, { timeoutMs = PROBE_TIMEOUT_MS } = {}) {
+export async function probeDshBaseUrl(baseUrl, { timeoutMs = PROBE_TIMEOUT_MS, requireNamespace = '' } = {}) {
   const base = normalizeDshBaseUrl(baseUrl);
   if (!base || !isLoopbackBase(base)) return false;
   // 没有签名密钥就没有离线铸造 Cookie；此时不探测（否则每个端口都会 401，白白扫一遍）。
@@ -78,7 +87,12 @@ export async function probeDshBaseUrl(baseUrl, { timeoutMs = PROBE_TIMEOUT_MS } 
     });
     if (!response.ok) return false;
     const body = await response.json();
-    return body?.type === 'server-response' && body?.result?.ok === true;
+    if (!(body?.type === 'server-response' && body?.result?.ok === true)) return false;
+    if (!requireNamespace) return true;
+    // 形状在不同 DSH 版本里略有差别（result.value / result 本体），两种都认。
+    const payload = body?.result?.value ?? body?.result ?? {};
+    const namespaces = Array.isArray(payload?.namespaces) ? payload.namespaces : [];
+    return namespaces.some((entry) => (entry?.ns ?? entry?.namespace) === requireNamespace);
   } catch {
     return false;
   } finally {
@@ -152,15 +166,17 @@ async function windowsListeningPorts() {
  * 找到真正在跑的 DSH。
  * @param options.current - 配置里的 baseUrl（作为候选之一）。
  * @param options.log - 诊断日志回调。
+ * @param options.requireNamespace - 必须存在的 settings 命名空间（挡住别的实例）。
  * @returns 探通的基址；找不到返回 null。
  */
-export async function discoverDshBaseUrl({ current, log = () => {} } = {}) {
+export async function discoverDshBaseUrl({ current, log = () => {}, requireNamespace = '' } = {}) {
   const candidates = await listDshCandidateBaseUrls({ current });
   for (const base of candidates) {
-    if (await probeDshBaseUrl(base)) return base;
+    if (await probeDshBaseUrl(base, { requireNamespace })) return base;
   }
   if (candidates.length > 1) {
-    log(`DSH 端点自愈：试过 ${candidates.length} 个候选地址，没有一个响应 settings/describe`);
+    const hint = requireNamespace ? `（且必须带 ${requireNamespace} 命名空间）` : '';
+    log(`DSH 端点自愈：试过 ${candidates.length} 个候选地址，没有一个响应 settings/describe${hint}`);
   }
   return null;
 }

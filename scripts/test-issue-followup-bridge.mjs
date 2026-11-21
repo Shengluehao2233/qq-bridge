@@ -159,9 +159,10 @@ await test('#107 the owner cannot be locked out by the sender ignore list', {
 });
 
 let discoveryCalls = 0;
+let discoveryOpts = null;
 await test('#56 disabling port discovery makes no probe or rebind; enabling restores the normal path', {
   config: { dsh: { authToken: 'fixture-only', autoDiscoverPort: false } },
-  globals: { discoverDshBaseUrl: async () => { discoveryCalls++; return 'http://127.0.0.1:3999'; } }
+  globals: { discoverDshBaseUrl: async (opts) => { discoveryCalls++; discoveryOpts = opts; return 'http://127.0.0.1:3999'; } }
 }, async (h) => {
   let current = 'http://127.0.0.1:3080';
   let rebinds = 0;
@@ -176,14 +177,19 @@ await test('#56 disabling port discovery makes no probe or rebind; enabling rest
   assert.equal(discoveryCalls, 1);
   assert.equal(rebinds, 1);
   assert.equal(current, 'http://127.0.0.1:3999');
+  // 身份校验：自愈必须带上「这是 QQ 侧的 DSH」这个约束，否则会连到桌面版实例
+  // （两者都认离线铸造的 Cookie，探活成功证明不了身份）。
+  assert.equal(discoveryOpts?.requireNamespace, 'qq-mode', '自愈必须把 identityNamespace 传给探测函数');
   assert.equal(await h.rediscoverDshBase(), false, 'the existing discovery cooldown remains effective');
   assert.equal(discoveryCalls, 1);
 });
 
-await test('#56 automatic port discovery stays enabled by default', {}, async (h) => {
-  assert.equal(h.cfg.dsh.autoDiscoverPort, true);
+await test('#56 automatic port discovery is OFF by default (cross-instance hijack guard)', {}, async (h) => {
+  // 2026-11-22：3082 被睡眠带走后，默认开启的自愈把桥接接到了桌面版 DSH（11533），
+  // 那个实例同样能通过 Cookie 探活，于是 QQ 消息被桌面 profile 的 agent 处理。
+  assert.equal(h.cfg.dsh.autoDiscoverPort, false);
   h.api.resolveBase = () => 'http://127.0.0.1:3080';
-  assert.equal(await h.rediscoverDshBase(), false, 'the default fixture discovers no alternate DSH endpoint');
+  assert.equal(await h.rediscoverDshBase(), false, '默认不探测、不改连其它 DSH 实例');
 });
 
 await test('#80 ordinary chat input cannot create trusted prompt headings', {}, async (h) => {

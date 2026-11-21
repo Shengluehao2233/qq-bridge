@@ -38,3 +38,15 @@ DshBot\health.cmd --fix           :: 桥接没起时顺手拉起（其余只报�
 2. `桥接` 红且提示 `dshReady=false` → 去起 DSH 3082（`start-dsh-qq.cmd`），桥接会自己连上。
 3. 只有 `MCP 工具表` 红 → 重启 3082 即可；重启会话最好挑没有回合在跑的时候。
 4. 全绿但群里仍没反应 → 看 `qq-bridge\state\bridge.log` 里有没有 `忽略非管理员` / `白名单` 相关日志，那属于策略问题不是故障。
+
+## 桥接连的是「哪一个」DSH
+
+`桥接（qq-bridge）` 那一条现在会把桥接实际连着的 DSH 地址打出来（如 `dsh=http://127.0.0.1:3082`），并断言它等于本次检查的这个端口。
+
+为什么单独加这条：同一台机器上可能同时跑着两个 DSH（桌面版随机端口 + CLI 版 3082），两者都用本机签名密钥离线铸造 Cookie，所以「探活成功」证明不了身份。2026-11-22 凌晨 3082 被系统睡眠带走后，桥接的端点自愈扫本机端口接到了桌面版 DSH（11533）：`dshReady` 一直是 true、health 全绿，但 QQ 群消息实际由桌面 profile 的 agent 处理（错误的人设、工具、记忆）。
+
+现在的行为：
+
+- `dsh.autoDiscoverPort` 默认 false，桥接只认 `dsh.baseUrl`；3082 不在就入队等待，并在日志里说明「不会改连其它实例」。
+- 需要打开自愈时（`dsh.autoDiscoverPort: true`），候选地址必须通过身份校验：`settings/describe` 的命名空间里要有 `dsh.identityNamespace`（默认 `qq-mode`）。回归测试：`npm run test:dsh-endpoint`。
+- health 红了会直接说「连的是 X，不是 Y」，处理办法是重启桥接，并确认 `config.json` 里的 `dsh.baseUrl` 与 `dsh.autoDiscoverPort`。

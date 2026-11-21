@@ -804,7 +804,11 @@ function loadConfig() {
       authPrefix: 'Bearer',
       // 是否允许把 DSH launch token 发往非回环地址（默认 false：那是进程启动凭据）
       allowRemote: false,
-      autoDiscoverPort: true,
+      // 默认关闭：跨实例自愈会把桥接接到同一台机器上的**另一个** DSH（桌面版随机端口），
+      // 那个实例同样能通过 Cookie 探活，但人设/工具/记忆都不是 QQ 侧的那套。
+      // 需要时显式打开，并且必须带 identityNamespace 做身份校验。
+      autoDiscoverPort: false,
+      identityNamespace: 'qq-mode',
       ...(file.dsh ?? {})
     },
     snowluma: { wsUrl: 'ws://127.0.0.1:2001', accessToken: '', ...(file.snowluma ?? {}) },
@@ -3397,6 +3401,17 @@ async function main() {
   // DSH 可用性探活 + 重启容错队列：
   // DSH 重启期间收到的 QQ 消息先入队（不丢），DSH 恢复后按序补投。
   let dshReady = false;
+  // 最近一次探活成功的时间（/api/status 暴露给 health-check，用来区分「刚起来」与「早就绿了」）。
+  let dshLastOkAt = 0;
+  // 桥接当前连着的 DSH 地址。测试替身（test-audit-bridge 等）不实现 resolveBase，
+  // 所以必须容错 —— 否则 /api/status 会抛 500，看起来像安全失败。
+  const currentDshBaseUrl = () => {
+    try {
+      return typeof api.resolveBase === 'function' ? api.resolveBase() : '';
+    } catch {
+      return '';
+    }
+  };
   let dshCheckStarted = false;
   let snowlumaWatchStarted = false; // SnowLuma 上游健康探测只启动一次（见 startSnowlumaWatch）
   let currentMode = 'chat'; // chat | closed-agent | reserved（仿真模式，由 DSH settings / state/mode.json 驱动）
@@ -3751,21 +3766,27 @@ async function main() {
   // 只在探活**失败**时触发：成功路径一个额外请求都不发。见 src/dsh-endpoint.js。
   const DSH_REDISCOVER_COOLDOWN_MS = 30 * 1000;
   let dshRediscoverAfter = 0;
+  const dshIdentityNamespace = String(cfg.dsh?.identityNamespace ?? 'qq-mode');
   const rediscoverDshBase = async () => {
-    if (cfg.dsh?.autoDiscoverPort === false) return false;
+    // 默认**关闭**：桌面版 DSH 与 CLI 版 DSH 会同时监听，两者都认离线铸造的 Cookie，
+    // 「探得通 settings/describe」不能证明它是我们该连的那个实例。2026-11-22 凌晨
+    // 3082 被睡眠带走后，桥接「自愈」到了桌面版随机端口 11533，QQ 消息实际由
+    // 桌面 profile 的 agent 处理（错误的人设/工具/记忆），而 health 仍是绿的。
+    // 需要桌面版随机端口场景时，显式配置 dsh.autoDiscoverPort: true。
+    if (cfg.dsh?.autoDiscoverPort !== true) return false;
     if (Date.now() < dshRediscoverAfter) return false;
     dshRediscoverAfter = Date.now() + DSH_REDISCOVER_COOLDOWN_MS;
     const previous = api.resolveBase();
     let found = null;
     try {
-      found = await discoverDshBaseUrl({ current: previous, log });
+      found = await discoverDshBaseUrl({ current: previous, log, requireNamespace: dshIdentityNamespace });
     } catch (error) {
       log('DSH 端点自愈异常:', error?.message ?? error);
       return false;
     }
     if (!found || found === previous) return false;
     api.rebind(found);
-    log(`DSH 端点已自愈：${previous} → ${found}（桌面版每次启动端口随机）`);
+    log(`DSH 端点已自愈：${previous} → ${found}（已校验 ${dshIdentityNamespace} 命名空间）`);
     return true;
   };
   const checkDsh = async () => {
@@ -3782,6 +3803,7 @@ async function main() {
       } catch {}
     }
     if (ok) {
+      dshLastOkAt = Date.now();
       // 模式来源：'dsh' = 设置页说了算；'local' = DSH 正常但没注册 qq-mode 命名空间，
       // 回退本地 mode.json。DSH 不可用的情况走不到这里（见下方 else）。
       const modeSource = await refreshMode();
@@ -3831,6 +3853,11 @@ async function main() {
     } else if (dshReady) {
       dshReady = false;
       log('⚠️ DSH 不可用（重启中？），QQ 消息将入队等待');
+      // 端点自愈默认关闭：必须明确说出「我在等哪个地址」，否则运维会以为桥接已经
+      // 换了实例、或者以为它自己会找到新端口（2026-11-22 那次的踩法）。
+      if (cfg.dsh?.autoDiscoverPort !== true) {
+        log(`⚠️ 端点自愈已关闭（dsh.autoDiscoverPort=false）：只等待 ${currentDshBaseUrl()} 恢复，不会改连其它 DSH 实例`);
+      }
       // 此时 refreshMode 读不到设置页，模式会退回本地 state/mode.json。把这件事明确打出来：
       // 否则「模式无声降级」看起来就像机器人性格突然变了。
       const localMode = readJsonSafe(path.join(STATE_DIR, 'mode.json'), null)?.mode;
@@ -4499,6 +4526,12 @@ async function main() {
             role: rs.role ?? null,
             roleMode: rs.mode ?? 'active',
             dshReady,
+            // 桥接当前真正连着的 DSH 地址，以及端点自愈是否开启。
+            // health-check 用它断言「桥接连的就是配置里的那个 DSH」——只信 dshReady
+            // 会漏掉「自愈接到了别的实例」这种情况（2026-11-22 的事故）。
+            dshBaseUrl: currentDshBaseUrl(),
+            dshAutoDiscover: cfg.dsh?.autoDiscoverPort === true,
+            dshLastOkAt: dshLastOkAt || null,
             ownerQQ: cfg.ownerQQ ?? null,
             allowGroups: cfg.allow?.groups ?? [],
             allowPrivate: cfg.allow?.private ?? [],

@@ -82,6 +82,8 @@ const tests = [
   'test-agent-preset-patches.mjs', 'test-tool-restrict-guard.mjs', 'test-tool-surface.mjs',
   'test-media-normalize.mjs', 'test-stickers.mjs', 'test-forward.mjs',
   'test-v2-wait.mjs', 'test-time-awareness.mjs', 'test-wait-backlog.mjs',
+  // 端点自愈的身份校验：必须挡住「同一台机器上的另一个 DSH」（桌面版随机端口）。
+  'test-dsh-endpoint-identity.mjs',
   '../src/core/session-router.test.mjs',
 ];
 let failed = 0;
